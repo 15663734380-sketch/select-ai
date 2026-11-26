@@ -46,6 +46,19 @@ LOG_PATH = APP_DIR / "error.log"
 HISTORY_PATH = APP_DIR / "history.json"
 HISTORY_MAX = 100    # 最多保留的历史问答条数
 
+
+def resource_path(name: str) -> Path:
+    """图标等只读资源：优先程序目录，打包后回退到内部资源目录。"""
+    p = APP_DIR / name
+    if p.exists():
+        return p
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        q = Path(base) / name
+        if q.exists():
+            return q
+    return p
+
 # 浅蓝配色（护眼）：取自应用图标的天蓝发梢与白色荷叶边
 # 层次：淡蓝窗口底 → 更浅的近白圆角卡片（文字框）→ 深海军蓝文字
 BG = "#dfeefb"           # 窗口底色：淡蓝
@@ -334,7 +347,7 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()  # 先隐藏，等界面与尺寸就绪后一次性显示
         self.root.title("划词问答")
-        ico = APP_DIR / "app.ico"
+        ico = resource_path("app.ico")
         if ico.exists():
             try:
                 self.root.iconbitmap(str(ico))
@@ -355,7 +368,7 @@ class App:
         try:
             from PIL import Image, ImageTk
 
-            src = Image.open(APP_DIR / "app_mascot.png").convert("RGBA")
+            src = Image.open(resource_path("app_mascot.png")).convert("RGBA")
             side = int(40 * self.ui)
             self.mascot = ImageTk.PhotoImage(src.resize((side, side), Image.LANCZOS))
         except Exception:
@@ -1303,7 +1316,7 @@ class App:
         win.configure(bg=BG)
         win.transient(self.root)
         try:
-            win.iconbitmap(str(APP_DIR / "app.ico"))
+            win.iconbitmap(str(resource_path("app.ico")))
         except Exception:
             pass
         win.minsize(480, 380)
@@ -1604,7 +1617,7 @@ class App:
         win.transient(self.root)
         win.resizable(False, False)
         try:
-            win.iconbitmap(str(APP_DIR / "app.ico"))
+            win.iconbitmap(str(resource_path("app.ico")))
         except Exception:
             pass
 
