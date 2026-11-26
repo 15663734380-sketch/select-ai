@@ -5,7 +5,7 @@ a = Analysis(
     ['select_ai.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('app.ico', '.'), ('app_mascot.png', '.')],
     hiddenimports=['pynput.keyboard._win32', 'pynput.mouse._win32'],
     hookspath=[],
     hooksconfig={},
