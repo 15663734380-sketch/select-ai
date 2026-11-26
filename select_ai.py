@@ -332,6 +332,7 @@ class App:
         self.current_question = ""
 
         self.root = tk.Tk()
+        self.root.withdraw()  # 先隐藏，等界面与尺寸就绪后一次性显示
         self.root.title("划词问答")
         ico = APP_DIR / "app.ico"
         if ico.exists():
@@ -365,14 +366,24 @@ class App:
         self.root.attributes("-topmost", bool(self.cfg.get("topmost", True)))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Unmap>", self._on_minimize)
-        self.root.after(200, self._fit_on_screen)
         self.root.after(600, self._titlebar)
 
         self._build_ui()
         self.root.update_idletasks()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         need_w = max(430, min(self.root.winfo_reqwidth(), 560))
-        need_h = min(self.root.winfo_reqheight(), self.root.winfo_screenheight() - 100)
-        self.root.geometry(f"{need_w}x{need_h}")
+        need_h = min(self.root.winfo_reqheight(), sh - 100)
+        pos = self.cfg.get("window_pos")
+        if isinstance(pos, list) and len(pos) == 2:
+            x, y = int(pos[0]), int(pos[1])
+        else:
+            x, y = sw - need_w - 40, 140
+        x = max(20, min(x, sw - need_w - 20))
+        y = max(20, min(y, sh - need_h - 60))
+        self.root.geometry(f"{need_w}x{need_h}+{x}+{y}")
+        self.root.update()  # 先把界面绘制完成，避免首帧空白小窗
+        self.root.deiconify()
+        self.root.lift()
 
         # 全局鼠标 & 热键监听
         self.mouse_listener = mouse.Listener(on_click=self._on_click)
@@ -1392,14 +1403,17 @@ class App:
         btn_export.configure(command=lambda: self.export_history(win, tip))
 
         win.update_idletasks()
-        w = min(620, win.winfo_screenwidth() - 80)
-        h = min(max(win.winfo_reqheight(), 500), win.winfo_screenheight() - 100)
-        x = max(0, self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2)
-        y = max(0, self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = min(620, sw - 80)
+        h = min(max(win.winfo_reqheight(), 500), sh - 100)
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+        x = max(20, min(x, sw - w - 20))
+        y = max(20, min(y, sh - h - 60))
         win.geometry(f"{w}x{h}+{x}+{y}")
+        win.update()  # 先把内容绘制完成再显示，避免首帧深色底一闪
         win.deiconify()
         win.lift()
-        win.after(60, lambda: self._fit_window_on_screen(win))
 
     def export_history(self, parent, tip_label) -> None:
         if not self.history:
@@ -1584,10 +1598,10 @@ class App:
     # ------------------------------------------------------------ 设置
     def open_settings(self) -> None:
         win = tk.Toplevel(self.root)
+        win.withdraw()  # 先隐藏，等内容与尺寸就绪后再显示，避免开场闪黑框
         win.title("设置")
         win.configure(bg=BG)
         win.transient(self.root)
-        win.grab_set()
         win.resizable(False, False)
         try:
             win.iconbitmap(str(APP_DIR / "app.ico"))
@@ -1712,13 +1726,17 @@ class App:
 
         # 按内容计算高度，确保「保存/取消」始终可见（高 DPI 下尤其重要）
         win.update_idletasks()
-        h = min(win.winfo_reqheight(), win.winfo_screenheight() - 80)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        h = min(win.winfo_reqheight(), sh - 80)
         px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
         pw, ph = self.root.winfo_width(), self.root.winfo_height()
-        x = max(0, px + (pw - 480) // 2)
-        y = max(0, py + (ph - h) // 2)
+        x = max(20, min(px + (pw - 480) // 2, sw - 480 - 20))
+        y = max(20, min(py + (ph - h) // 2, sh - h - 60))
         win.geometry(f"480x{h}+{x}+{y}")
-        self._fit_window_on_screen(win)
+        win.update()  # 先把内容绘制完成再显示，避免首帧深色底一闪
+        win.deiconify()
+        win.lift()
+        win.grab_set()
 
         def on_save():
             self.cfg["base_url"] = e_url.get().strip()
