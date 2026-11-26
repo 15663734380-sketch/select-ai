@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+installer/*.exe
+config.json
+history.json
+error.log
+*.log
+*.bak
