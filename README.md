@@ -13,3 +13,6 @@
 ## 运行
 
 安装依赖后执行 `pythonw select_ai.py`，首次使用在「设置」里填写 API Key。
+
+
+https://platform.deepseek.com/usage；在这个平台上买API key然后用Flash模型便宜还好用，推荐一下
