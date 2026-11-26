@@ -151,6 +151,14 @@ def clip_set(text: str) -> None:
         pass
 
 
+def clipboard_seq() -> int:
+    """剪贴板修改序号：每次内容被写入都会 +1，用于判断期间是否被别处改动。"""
+    try:
+        return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+    except Exception:
+        return 0
+
+
 def ctrl_or_alt_down() -> bool:
     """Ctrl / Alt 按下时不触发，避免误伤 Ctrl+拖拽等其它操作。"""
     try:
@@ -356,6 +364,7 @@ class App:
         self.root.geometry(self._initial_geometry())
         self.root.attributes("-topmost", bool(self.cfg.get("topmost", True)))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Unmap>", self._on_minimize)
         self.root.after(200, self._fit_on_screen)
         self.root.after(600, self._titlebar)
 
@@ -923,6 +932,17 @@ class App:
                                    highlightbackground=ACCENT)
             self.status.config(text="已暂停 · 点「开始检测」生效")
 
+    def _on_minimize(self, event=None) -> None:
+        """窗口最小化时自动暂停检测，避免在后台无意识地消耗 token。"""
+        if event is not None and event.widget is not self.root:
+            return
+        try:
+            if self.root.state() == "iconic" and self.listening:
+                self.toggle_listen()
+                self.status.config(text="窗口已最小化 · 检测已暂停")
+        except Exception:
+            log("最小化暂停失败\n" + traceback.format_exc())
+
     def _on_topmost(self) -> None:
         v = bool(self.var_top.get())
         self.root.attributes("-topmost", v)
@@ -1026,10 +1046,13 @@ class App:
 
     def _capture(self) -> None:
         try:
-            time.sleep(0.08)  # 等选区稳定
+            time.sleep(0.1)  # 等选区稳定
             if self._foreground_is_self():
                 return
+            if ctrl_or_alt_down():
+                return  # 用户正按着 Ctrl/Alt（多半要复制），不抢占剪贴板
             old = clip_get()
+            seq0 = clipboard_seq()
             kc = keyboard.Controller()
             kc.press(keyboard.Key.ctrl)
             try:
@@ -1039,9 +1062,13 @@ class App:
                 kc.release(keyboard.Key.ctrl)
             time.sleep(0.16)
             text = clip_get()
-            if text == old:
+            seq1 = clipboard_seq()
+            if text == old or (seq0 and seq1 == seq0):
                 return  # Ctrl+C 没生效：不是文字选区（比如拖动了滚动条）
-            clip_set(old)  # 还原用户原剪贴板
+            # 抓取期间若用户又复制了新内容（序号变化）或正按着 Ctrl，就保留用户剪贴板，
+            # 避免把用户刚复制的文字覆盖回旧内容。
+            if not (seq1 and clipboard_seq() != seq1) and not ctrl_or_alt_down():
+                clip_set(old)  # 还原用户原剪贴板
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             text = re.sub(r"[ \t]+", " ", text)
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
