@@ -70,7 +70,7 @@ MONO = "Consolas"
 
 DOC_CHUNK = 700      # 文档分块大小（字符）
 DOC_TOP_K = 4        # 每次最多引用的片段数
-DOC_BUDGET = 3000    # 每次随问题附带的文档片段总字数上限
+DOC_BUDGET = 50000    # 每次随问题附带的文档片段总字数上限
 
 HEADING_RE = re.compile(
     r"^(#{1,6}\s|第[一二三四五六七八九十百零两\d]+[章节篇部]|chapter\s+\d)",
