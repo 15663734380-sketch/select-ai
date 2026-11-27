@@ -21,6 +21,7 @@
 import ctypes
 import json
 import queue
+import random
 import re
 import sys
 import threading
@@ -35,6 +36,12 @@ from tkinter import filedialog, ttk
 import pyperclip
 import requests
 from pynput import keyboard, mouse
+
+try:  # 桌宠动画引擎（只负责画面与动画，不含交互）
+    from pet_anim import PetAnimator, layout as pet_layout
+except Exception:  # 引擎缺失时桌宠不显示，其余功能不受影响
+    PetAnimator = None
+    pet_layout = None
 
 if getattr(sys, "frozen", False):
     # 打包成 exe 后：配置、历史、图标都放在 exe 同目录
@@ -107,6 +114,9 @@ DEFAULT_CONFIG = {
     "last_doc_path": "",
     "topmost": True,
     "window_pos": None,
+    "pet_enabled": False,
+    "pet_pos": None,
+    "pet_size": 128,
 }
 
 
@@ -322,6 +332,7 @@ def retrieve_chunks(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: i
 class App:
     def __init__(self) -> None:
         self.cfg = load_config()
+        self.cfg["topmost"] = True  # 每次启动都默认置顶
         self.listening = False
         self.gen = 0
         self.answer_text = ""
@@ -334,6 +345,20 @@ class App:
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self._moved_by_self = False
         self.footer_hidden = False
+        self.pet = None
+        self.pet_photo = None
+        self.pet_drag = None
+        self.pet_size = 128
+        self.pet_exited = False
+        self.balance_loading = False
+        self.balance_bubble = None
+        self._bubble_after = None
+        self._bubble_size = (0, 0)
+        self._fade_start = None
+        self._pet_menu_obj = None
+        self.pet_anim = None
+        self._egg_after = None
+        self.ask_grip = None
 
         # 文档上下文（加载后常驻内存，提问时检索相关片段随问题发送）
         self.doc_lock = threading.Lock()
@@ -351,12 +376,7 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()  # 先隐藏，等界面与尺寸就绪后一次性显示
         self.root.title("划词问答")
-        ico = resource_path("app.ico")
-        if ico.exists():
-            try:
-                self.root.iconbitmap(str(ico))
-            except Exception:
-                pass
+        self._apply_icon(self.root)
         self.root.configure(bg=BG)
 
         # 界面缩放系数（96 DPI = 1.0）：像素尺寸随屏幕缩放
@@ -383,6 +403,7 @@ class App:
         self.root.attributes("-topmost", bool(self.cfg.get("topmost", True)))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Unmap>", self._on_minimize)
+        self.root.bind("<Map>", self._on_restore)
         self.root.after(600, self._titlebar)
 
         self._build_ui()
@@ -399,8 +420,11 @@ class App:
         y = max(20, min(y, sh - need_h - 60))
         self.root.geometry(f"{need_w}x{need_h}+{x}+{y}")
         self.root.update()  # 先把界面绘制完成，避免首帧空白小窗
+        self.std_h = 0
         self.root.deiconify()
         self.root.lift()
+        self.root.update_idletasks()
+        self.std_h = self.root.winfo_height()  # 主窗口标准高度（初版布局）
 
         # 全局鼠标 & 热键监听
         self.mouse_listener = mouse.Listener(on_click=self._on_click)
@@ -435,6 +459,45 @@ class App:
             return int(ctypes.windll.user32.GetAncestor(int((win or self.root).winfo_id()), 2))
         except Exception:
             return 0
+
+    def _apply_icon(self, win) -> None:
+        """按 DPI 精确加载图标尺寸，避免任务栏把大图缩放后发虚。"""
+        ico = str(resource_path("app.ico"))
+        try:
+            win.iconbitmap(ico)
+        except Exception:
+            pass
+        try:
+            win.update_idletasks()
+            hwnd = self._hwnd(win)
+            if not hwnd:
+                return
+            u = ctypes.windll.user32
+            u.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+            u.GetDpiForWindow.restype = ctypes.c_uint
+            dpi = int(u.GetDpiForWindow(ctypes.c_void_p(hwnd))) or 96
+            u.LoadImageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            u.LoadImageW.restype = ctypes.c_void_p
+            u.SendMessageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p
+            ]
+            if not hasattr(self, "_icon_cache"):
+                self._icon_cache = {}
+            # 小图标供任务栏/标题栏，大图标供 Alt+Tab；按 96 DPI 基准乘缩放
+            for slot, cx in ((0, round(24 * dpi / 96)), (1, round(32 * dpi / 96))):
+                key = (slot, cx)
+                hicon = self._icon_cache.get(key)
+                if not hicon:
+                    hicon = u.LoadImageW(None, ico, 1, cx, cx, 0x00000010)
+                    if hicon:
+                        self._icon_cache[key] = hicon
+                if hicon:
+                    u.SendMessageW(ctypes.c_void_p(hwnd), 0x80, slot, hicon)
+        except Exception:
+            log("设置窗口图标失败\n" + traceback.format_exc())
 
     def _fit_on_screen(self) -> None:
         """按窗口的真实像素尺寸把窗口收进屏幕内，避免高 DPI 下溢出。"""
@@ -659,7 +722,10 @@ class App:
         tk.Label(
             ask_head, text="划词或输入 · Enter 发送", fg=SUB, bg=BG, font=(FONT, 8)
         ).pack(side="right", padx=4)
-        sel_inner, sel_outline = self._card(body, BG, fill="x", pady=(5, 12))
+        ask_wrap = tk.Frame(body, bg=BG)
+        ask_wrap.pack(fill="x", pady=(5, 12))
+        self.ask_wrap = ask_wrap
+        sel_inner, sel_outline = self._card(ask_wrap, BG, fill="x")
         self.txt_sel = tk.Text(
             sel_inner,
             height=4,
@@ -680,7 +746,26 @@ class App:
             selectforeground=FG,
             inactiveselectbackground=SEL,
         )
-        self.txt_sel.pack(fill="x", padx=6, pady=3)
+        ask_sb = ttk.Scrollbar(
+            sel_inner,
+            orient="vertical",
+            command=self.txt_sel.yview,
+            style="Ocean.Vertical.TScrollbar",
+        )
+        self.txt_sel.configure(yscrollcommand=ask_sb.set)
+        ask_sb.pack(side="right", fill="y", padx=(2, 5), pady=3)
+        self.txt_sel.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=3)
+        self.txt_sel.bind("<MouseWheel>", self._ask_wheel)
+        # 提问框下边缘可拖动加高（临时查看更多内容，窗口缩放时恢复标准高度）
+        self.ask_canvas = sel_inner.master
+        self.ask_inner = sel_inner
+        for w in (self.ask_canvas, sel_inner, self.txt_sel):
+            w.bind("<ButtonPress-1>", self._ask_grip_press)
+            w.bind("<Motion>", self._ask_grip_cursor)
+            w.bind("<Leave>", self._ask_grip_leave)
+        # 拖动过程中鼠标会移到其它部件上，交由窗口级绑定持续处理
+        self.root.bind("<B1-Motion>", self._ask_grip_move, add="+")
+        self.root.bind("<ButtonRelease-1>", self._ask_grip_release, add="+")
         self.txt_sel.bind("<Return>", self._ask_from_input)
         self.txt_sel.bind("<FocusIn>", lambda e: sel_outline(ACCENT))
         self.txt_sel.bind("<FocusOut>", lambda e: sel_outline(BORDER))
@@ -763,13 +848,30 @@ class App:
             arrowsize=12,
         )
         style.map("Ocean.Vertical.TScrollbar", background=[("active", "#b5d5f3")])
+
+        # 记录提问卡片的默认高度：拖动窗口上边缘时由它吸收高度变化
+        self.root.update_idletasks()
+        self.ask_h = max(60, ask_wrap.winfo_reqheight())
+        self.ask_default_h = self.ask_h  # 初版提问框高度：向上拉伸到此为止
+        sel_inner.master.pack_configure(fill="both", expand=True)
+        ask_wrap.pack_propagate(False)
+        ask_wrap.configure(height=self.ask_h)
+        self.ask_min_h = max(56, int(self.txt_sel.winfo_reqheight() * 0.6))
+        self._last_h = None
         self.root.bind("<Configure>", self._on_root_configure)
 
     def _on_root_configure(self, event) -> None:
-        """窗口变矮时先折叠底部操作栏，优先保证 AI 解答区可读。"""
+        """按拖动方向分配高度：下边缘改 AI 解答区，上边缘改提问内容区。"""
         if event.widget is not self.root:
             return
+        try:
+            if self.root.state() == "iconic":
+                return
+        except Exception:
+            pass
         h = event.height
+        lh = self._last_h
+        self._last_h = h
         try:
             if not self.footer_hidden and h <= FOOTER_HIDE_H:
                 self.footer_hidden = True
@@ -781,6 +883,72 @@ class App:
                 )
         except Exception:
             log("底部操作栏折叠失败\n" + traceback.format_exc())
+
+        # 识别拖的是哪条边：上边缘优先伸缩提问框，下边缘只动解答区。
+        try:
+            if lh is not None and h != lh and self.ask_h > self.ask_default_h:
+                if h < lh:
+                    # 缩小窗口时先把临时加高的部分逐步收回来，再按标准逻辑继续缩
+                    extra = self.ask_h - self.ask_default_h
+                    take = min(extra, lh - h)
+                    self._set_ask_h(self.ask_h - take, h, allow_expand=True)
+                    if take >= lh - h:
+                        return
+                    lh -= take  # 剩余压缩量按标准逻辑处理
+                else:
+                    return  # 放大窗口时保留手动加高的提问框
+            if lh is None or h == lh or not self.std_h:
+                return
+            if self._resize_is_top():
+                # 窗口在标准高度以上时提问框保持初版大小；
+                # 低于标准高度时，只有超出部分才压缩/恢复提问框。
+                change = max(0, self.std_h - lh) - max(0, self.std_h - h)
+                self._set_ask_h(self.ask_h + change, h)
+            elif h < lh:
+                self._clamp_ask_h(h)
+        except Exception:
+            log("提问区缩放失败\n" + traceback.format_exc())
+
+    def _resize_is_top(self) -> bool:
+        """根据鼠标是否停在窗口上边缘判断当前是拖上边还是下边。"""
+        try:
+            r = wintypes.RECT()
+            p = wintypes.POINT()
+            hwnd = self._hwnd(self.root)
+            if hwnd and ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+                top_d = abs(p.y - r.top)
+                bottom_d = abs(p.y - r.bottom)
+                if min(top_d, bottom_d) <= 24:
+                    return top_d < bottom_d
+        except Exception:
+            pass
+        return False
+
+    def _set_ask_h(self, value: int, total_h: int = 0, allow_expand: bool = False) -> None:
+        """设置提问内容框高度（像素）：默认最大回到初版高度，手动拖动可临时加高。"""
+        value = int(value)
+        if allow_expand and total_h:
+            limit = max(self.ask_default_h, int(total_h) - 340)
+        else:
+            limit = self.ask_default_h
+            if total_h and int(total_h) < self.std_h:
+                # 窗口比标准尺寸小时，给解答区留出最低可读空间
+                limit = min(limit, max(self.ask_min_h, int(total_h) - 320))
+        value = max(self.ask_min_h, min(value, limit))
+        if value == self.ask_h:
+            return
+        self.ask_h = value
+        try:
+            self.ask_wrap.configure(height=value)
+        except Exception:
+            pass
+
+    def _clamp_ask_h(self, total_h: int) -> None:
+        """下边缘缩小时，提问区若过高则让出空间给解答区。"""
+        limit = min(self.ask_default_h, max(self.ask_min_h, int(total_h) - 320))
+        if self.ask_h > limit:
+            self._set_ask_h(limit)
 
     def _setup_tags(self) -> None:
         self.txt_ans.tag_configure("h", font=(FONT, 11, "bold"), foreground=GOLD, spacing1=6, spacing3=4)
@@ -981,15 +1149,529 @@ class App:
             self.status.config(text="已暂停 · 点「开始检测」生效")
 
     def _on_minimize(self, event=None) -> None:
-        """窗口最小化时自动暂停检测，避免在后台无意识地消耗 token。"""
+        """窗口最小化时自动暂停检测，并显示悬浮的鲸鱼娘桌宠。"""
         if event is not None and event.widget is not self.root:
             return
         try:
-            if self.root.state() == "iconic" and self.listening:
-                self.toggle_listen()
-                self.status.config(text="窗口已最小化 · 检测已暂停")
+            if self.root.state() == "iconic":
+                if self.listening:
+                    self.toggle_listen()
+                    self.status.config(text="窗口已最小化 · 检测已暂停")
+                if self.cfg.get("pet_enabled") and not self.pet_exited:
+                    self._show_pet()
+                self._sync_pet_base()
         except Exception:
-            log("最小化暂停失败\n" + traceback.format_exc())
+            log("最小化处理失败\n" + traceback.format_exc())
+
+    # ------------------------------------------------------------ 桌宠
+    PET_MIN = 48
+    PET_MAX = 320
+    PET_STEP = 16
+
+    def _clamp_pet_pos(self, x: float, y: float, size: int) -> tuple:
+        """把桌宠姿态图左上角限制在屏幕内，保证整个窗口（含跳跃留白）不越界。
+
+        返回的是姿态图左上角坐标；窗口原点需再减去 pet_layout 的边距。
+        屏幕分辨率变化、或换机后旧坐标超出范围时，这个方法保证桌宠仍可见。
+        """
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        try:
+            w, h, lm, tm = pet_layout(size)
+        except Exception:
+            w = h = size
+            lm = tm = 0
+        x = max(lm, min(int(x), max(lm, sw - w + lm - 8)))
+        y = max(tm, min(int(y), max(tm, sh - h + tm - 8)))
+        return x, y
+
+    def _pet_loader(self, name: str):
+        """桌宠姿态图：pet/<状态>.png；某个姿态图缺失时由引擎回退到顶栏形象图。"""
+        from PIL import Image
+
+        if name == "fallback":
+            return Image.open(resource_path("app_mascot.png"))
+        return Image.open(resource_path(f"pet/{name}.png"))
+
+    def _pet_trigger(self, state: str, hold: float = None) -> None:
+        """触发桌宠的一个临时形态（吓一跳 / 捧元宝），到时自动回到基础形态。"""
+        if self.pet_anim is not None:
+            self.pet_anim.trigger(state, hold)
+
+    def _sync_pet_base(self) -> None:
+        """桌宠的基础形态跟随主窗口：最小化时发呆，否则认真观察。"""
+        idle = self.root.state() == "iconic"
+        if self.pet_anim is not None:
+            self.pet_anim.set_base("idle" if idle else "observe")
+        self._schedule_egg()
+
+    def _schedule_egg(self) -> None:
+        """发呆彩蛋：主窗口最小化期间，随机 2 分钟到 1 小时后冒一句「有认真学习吗」。"""
+        self._cancel_egg()
+        if self.pet is None or self.pet_anim is None or self.root.state() != "iconic":
+            return
+        self._egg_after = self.root.after(random.randint(120, 3600) * 1000, self._egg_fire)
+
+    def _cancel_egg(self) -> None:
+        if self._egg_after is not None:
+            try:
+                self.root.after_cancel(self._egg_after)
+            except Exception:
+                pass
+            self._egg_after = None
+
+    def _egg_fire(self) -> None:
+        self._egg_after = None
+        if self.pet is None or self.root.state() != "iconic":
+            return
+        self._show_balance_bubble("有认真学习吗", stay_ms=4000)
+        self._schedule_egg()
+
+    def _pet_motion(self, event) -> None:
+        """鼠标在桌宠身上移动（未按下）：盯着鼠标方向看。"""
+        if self.pet_anim is None or self.pet_drag:
+            return
+        if self.pet_anim.alpha_at(event.x, event.y) < 24:
+            self.pet_anim.hover(False)
+            return
+        self.pet_anim.hover(True, event.x, event.y)
+
+    def _pet_leave(self, event) -> None:
+        if self.pet_anim is not None:
+            self.pet_anim.hover(False)
+
+    def _show_pet(self) -> None:
+        """最小化后显示桌宠：可拖动换位置、滚轮改大小，单击恢复主窗口。"""
+        if self.pet is not None:
+            try:
+                self.pet.attributes("-topmost", False)
+                self.pet.deiconify()
+                self.pet.lower()
+                return
+            except Exception:
+                self.pet = None
+        if PetAnimator is None or pet_layout is None:
+            log("桌宠动画引擎不可用，桌宠不显示")
+            return
+        try:
+            self.pet_size = max(
+                self.PET_MIN, min(self.PET_MAX, int(self.cfg.get("pet_size") or 128))
+            )
+        except Exception:
+            self.pet_size = 128
+        size = self.pet_size
+        w, h, lm, tm = pet_layout(size)
+
+        win = tk.Toplevel(self.root)
+        win.withdraw()  # 先隐藏，等画面与位置就绪后再显示，避免闪动
+        win.overrideredirect(True)
+        win.attributes("-topmost", False)  # 桌宠只待在桌面层，不压住视频等窗口
+        try:
+            self.pet_anim = PetAnimator(
+                win,
+                self._pet_loader,
+                log=lambda: log("桌宠动画帧渲染失败\n" + traceback.format_exc()),
+            )
+            self.pet_anim.set_size(size)
+        except Exception:
+            self.pet_anim = None
+            win.destroy()
+            log("桌宠图片加载失败\n" + traceback.format_exc())
+            return
+
+        win.bind("<ButtonPress-1>", self._pet_press)
+        win.bind("<B1-Motion>", self._pet_move)
+        win.bind("<ButtonRelease-1>", self._pet_release)
+        win.bind("<MouseWheel>", self._pet_wheel)
+        win.bind("<Button-3>", self._pet_menu)
+        win.bind("<Motion>", self._pet_motion)
+        win.bind("<Leave>", self._pet_leave)
+
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        pos = self.cfg.get("pet_pos")
+        if isinstance(pos, list) and len(pos) == 2:
+            x, y = self._clamp_pet_pos(pos[0], pos[1], size)
+        else:
+            x, y = self._clamp_pet_pos(sw - size - 36, sh - size - 90, size)
+        # 窗口比姿态图大一圈（上方留给跳跃），所以窗口原点要往上、往左挪
+        win.geometry(f"{w}x{h}+{x - lm}+{y - tm}")
+
+        win.update_idletasks()
+        self.pet = win
+        self._sync_pet_base()
+        self.pet_anim.start()  # 第一帧先画好，再显示窗口
+        # 解除与主窗口的 owner 关系，避免主窗口最小化时桌宠被系统一并隐藏
+        try:
+            hwnd = self._hwnd(win)
+            if hwnd:
+                ctypes.windll.user32.SetWindowLongPtrW(hwnd, -8, 0)
+        except Exception:
+            pass
+        win.deiconify()
+        win.lower()  # 沉到普通窗口之下，回到桌面时仍然可见
+
+    def _pet_rect(self) -> tuple:
+        """桌宠姿态图所在方块的实际外框（物理像素），避免 Tk 位置滞后。
+        窗口比姿态图大一圈，这里换算回姿态图的左上角：拖动、位置记忆、气泡定位都按它算。"""
+        size = self.pet_size
+        _, _, lm, tm = pet_layout(size)
+        try:
+            r = wintypes.RECT()
+            hwnd = self._hwnd(self.pet)
+            if hwnd and ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return r.left + lm, r.top + tm, r.left + lm + size, r.top + tm + size
+        except Exception:
+            pass
+        x, y = self.pet.winfo_x(), self.pet.winfo_y()
+        return x + lm, y + tm, x + lm + size, y + tm + size
+
+    def _pet_press(self, event) -> None:
+        rx, ry, _, _ = self._pet_rect()
+        self.pet_drag = {
+            "x": event.x_root,
+            "y": event.y_root,
+            "wx": rx,
+            "wy": ry,
+            "moved": False,
+        }
+        if self.pet_anim is not None:
+            self.pet_anim.hover(False)
+        try:
+            event.widget.grab_set()  # 拖动时持续捕获鼠标，快速拖动也不丢事件
+        except Exception:
+            pass
+
+    def _pet_move(self, event) -> None:
+        d = self.pet_drag
+        if not d or self.pet is None:
+            return
+        dx, dy = event.x_root - d["x"], event.y_root - d["y"]
+        if abs(dx) + abs(dy) <= 3:
+            return
+        d["moved"] = True
+        x, y = self._clamp_pet_pos(d["wx"] + dx, d["wy"] + dy, self.pet_size)
+        try:
+            _, _, lm, tm = pet_layout(self.pet_size)
+            self.pet.geometry(f"+{x - lm}+{y - tm}")
+            self._move_balance_bubble(x, y)
+        except Exception:
+            pass
+
+    def _pet_release(self, event) -> None:
+        d = self.pet_drag
+        self.pet_drag = None
+        try:
+            event.widget.grab_release()
+        except Exception:
+            pass
+        if not d:
+            return
+        if not d["moved"]:
+            self._pet_trigger("startle")
+            self._restore_from_pet()
+            return
+        try:
+            rx, ry, _, _ = self._pet_rect()
+            self.cfg["pet_pos"] = [rx, ry]
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _pet_wheel(self, event) -> None:
+        if self.pet is None or not event.delta:
+            return
+        step = self.PET_STEP if event.delta > 0 else -self.PET_STEP
+        new_size = max(self.PET_MIN, min(self.PET_MAX, self.pet_size + step))
+        if new_size != self.pet_size:
+            self._resize_pet(new_size)
+
+    def _resize_pet(self, new_size: int) -> None:
+        """滚轮缩放桌宠，以中心为锚点并保持在屏幕内。"""
+        if self.pet is None or self.pet_anim is None or pet_layout is None:
+            return
+        try:
+            rx, ry, rr, rb = self._pet_rect()
+            cx, cy = (rx + rr) // 2, (ry + rb) // 2
+            x, y = self._clamp_pet_pos(cx - new_size // 2, cy - new_size // 2, new_size)
+            w, h, lm, tm = pet_layout(new_size)
+            self.pet_size = new_size
+            self.pet_anim.set_size(new_size)
+            self.pet.geometry(f"{w}x{h}+{x - lm}+{y - tm}")
+            self.pet.update_idletasks()
+            self._move_balance_bubble(x, y)
+        except Exception:
+            log("桌宠缩放失败\n" + traceback.format_exc())
+            return
+        self.cfg["pet_size"] = new_size
+        self.cfg["pet_pos"] = [x, y]
+        save_config(self.cfg)
+
+    # ------------------------------------------------------------ 余额
+    def _pet_menu(self, event) -> None:
+        """右键桌宠弹出的菜单。"""
+        if self.pet is None:
+            return
+        menu = None
+        try:
+            menu = tk.Menu(
+                self.root,
+                tearoff=0,
+                bg=CARD,
+                fg=FG,
+                activebackground=SEL,
+                activeforeground=FG,
+                font=(FONT, 9),
+                bd=0,
+            )
+            menu.add_command(label="显示余额", command=self._start_balance_query)
+            menu.add_command(label="退出", command=self._exit_pet)
+            self._pet_menu_obj = menu
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            log("桌宠菜单显示失败\n" + traceback.format_exc())
+        finally:
+            if menu is not None:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+
+    def _start_balance_query(self) -> None:
+        """查询 DeepSeek 账户余额，在桌宠左上角用气泡显示。"""
+        if self.balance_loading:
+            return
+        self._pet_trigger("money")
+        key = (self.cfg.get("api_key") or "").strip()
+        if not key:
+            self._show_balance_bubble("请先在设置中填写 API Key")
+            return
+        if "api.deepseek.com" not in str(self.cfg.get("base_url") or ""):
+            self._show_balance_bubble("当前接口无法查询余额\n仅支持 DeepSeek 官方接口")
+            return
+        self.balance_loading = True
+        self._show_balance_bubble("正在查询余额…")
+
+        def work() -> None:
+            msg = ""
+            try:
+                resp = requests.get(
+                    "https://api.deepseek.com/user/balance",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {key}",
+                    },
+                    timeout=12,
+                )
+                if resp.status_code == 401:
+                    msg = "查询失败：API Key 无效"
+                elif resp.status_code != 200:
+                    msg = f"查询失败（HTTP {resp.status_code}）"
+                else:
+                    data = resp.json()
+                    parts = []
+                    order = {"CNY": 0, "USD": 1}
+                    infos = sorted(
+                        data.get("balance_infos") or [],
+                        key=lambda it: order.get(
+                            str(it.get("currency") or "").upper(), 9
+                        ),
+                    )
+                    for item in infos:
+                        cur = str(item.get("currency") or "").upper()
+                        sym = {"CNY": "¥", "USD": "$"}.get(cur, f"{cur} ")
+                        parts.append(f"{sym}{item.get('total_balance', '0')}")
+                    if not parts:
+                        msg = "余额信息为空"
+                    else:
+                        msg = "余额：" + "   ".join(parts)
+                        if not data.get("is_available", True):
+                            msg += "\n余额不足，API 调用可能失败"
+            except requests.Timeout:
+                msg = "查询失败：请求超时"
+            except Exception as exc:
+                msg = f"查询失败：{str(exc)[:80]}"
+            self.msg_q.put(("balance", 0, msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_balance(self, msg: str) -> None:
+        self.balance_loading = False
+        self._pet_trigger("money")
+        if self.pet is None:
+            return
+        self._show_balance_bubble(msg)
+
+    def _show_balance_bubble(self, text: str, stay_ms: int = 3000) -> None:
+        """透明圆角气泡，定位在桌宠左上角。"""
+        self._hide_balance_bubble()
+        if self.pet is None:
+            return
+        try:
+            import tkinter.font as tkfont
+
+            font = tkfont.Font(family=FONT, size=10)
+            lines = text.split("\n")
+            tw = max(font.measure(line) for line in lines)
+            th = font.metrics("linespace") * len(lines)
+            bw, bh = tw + 28, th + 18
+            tail = 10
+            key = "#ff00fe"
+            cw, ch = bw + 2, bh + tail + 2
+            win = tk.Toplevel(self.root)
+            win.withdraw()
+            win.overrideredirect(True)
+            win.attributes("-topmost", False)
+            win.configure(bg=key)
+            try:
+                win.attributes("-transparentcolor", key)
+            except Exception:
+                pass
+            cv = tk.Canvas(win, width=cw, height=ch, bg=key, highlightthickness=0, bd=0)
+            cv.pack()
+            r = 10
+            x0, y0, x1, y1 = 1, 1, bw - 1, bh - 1
+            pts = [
+                x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0,
+                x1, y0 + r, x1, y1 - r, x1, y1 - r, x1, y1,
+                x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1,
+                x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0,
+            ]
+            cv.create_polygon(
+                pts, smooth=True, splinesteps=24, fill=CARD, outline=BORDER, width=1
+            )
+            tx = x1 - 26
+            cv.create_polygon(
+                tx, y1 - 1, tx + 14, y1 - 1, x1 - 6, y1 + tail,
+                fill=CARD, outline="",
+            )
+            cv.create_text(
+                (x0 + x1) // 2, (y0 + y1) // 2,
+                text=text, fill=FG, font=font, justify="left",
+            )
+            cv.bind("<Button-1>", lambda e: self._hide_balance_bubble())
+            px, py, _, _ = self._pet_rect()
+            bx = px + 14 - cw
+            by = py - ch - 2
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            bx = max(4, min(bx, sw - cw - 4))
+            by = max(4, min(by, sh - ch - 4))
+            win.geometry(f"{cw}x{ch}+{bx}+{by}")
+            win.update_idletasks()
+            win.deiconify()
+            win.lift()
+            try:
+                win.attributes("-alpha", 1.0)
+            except Exception:
+                pass
+            self.balance_bubble = win
+            self._bubble_size = (cw, ch)
+            self._fade_start = None
+            self._bubble_after = self.root.after(
+                max(200, int(stay_ms) - 1000), self._begin_bubble_fade
+            )
+        except Exception:
+            log("余额气泡显示失败\n" + traceback.format_exc())
+
+    def _begin_bubble_fade(self) -> None:
+        self._fade_start = time.monotonic()
+        self._fade_balance_bubble()
+
+    def _fade_balance_bubble(self) -> None:
+        """按真实时间以约 60fps 平滑淡出，总时长 1 秒。"""
+        win = self.balance_bubble
+        if win is None:
+            return
+        start = self._fade_start if self._fade_start is not None else time.monotonic()
+        t = min(1.0, max(0.0, (time.monotonic() - start) / 1.0))
+        smooth = t * t * (3.0 - 2.0 * t)  # smoothstep：首尾更柔和
+        try:
+            win.attributes("-alpha", max(0.0, 1.0 - smooth))
+        except Exception:
+            pass
+        if t < 1.0:
+            self._bubble_after = self.root.after(16, self._fade_balance_bubble)
+        else:
+            self._bubble_after = None
+            self._hide_balance_bubble()
+
+    def _move_balance_bubble(self, px: int = None, py: int = None) -> None:
+        """让气泡跟随桌宠移动，始终保持在桌宠左上角。"""
+        win = self.balance_bubble
+        cw, ch = self._bubble_size
+        if win is None or cw <= 0 or ch <= 0:
+            return
+        try:
+            if px is None or py is None:
+                px, py, _, _ = self._pet_rect()
+            bx = px + 14 - cw
+            by = py - ch - 2
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            bx = max(4, min(bx, sw - cw - 4))
+            by = max(4, min(by, sh - ch - 4))
+            win.geometry(f"+{bx}+{by}")
+        except Exception:
+            pass
+
+    def _hide_balance_bubble(self) -> None:
+        self._fade_start = None
+        if self._bubble_after is not None:
+            try:
+                self.root.after_cancel(self._bubble_after)
+            except Exception:
+                pass
+            self._bubble_after = None
+        if self.balance_bubble is not None:
+            try:
+                self.balance_bubble.destroy()
+            except Exception:
+                pass
+            self.balance_bubble = None
+
+    def _hide_pet(self) -> None:
+        self._cancel_egg()
+        if self.pet_anim is not None:
+            self.pet_anim.destroy()
+            self.pet_anim = None
+        self._hide_balance_bubble()
+        if self.pet is not None:
+            try:
+                self.pet.grab_release()
+            except Exception:
+                pass
+            try:
+                self.pet.destroy()
+            except Exception:
+                pass
+        self.pet = None
+        self.pet_photo = None
+        self.pet_drag = None
+
+    def _restore_from_pet(self) -> None:
+        """点击桌宠：立刻恢复主窗口，桌宠保持常驻。"""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            log("恢复主窗口失败\n" + traceback.format_exc())
+
+    def _on_restore(self, event=None) -> None:
+        """主窗口从最小化恢复：桌宠重新出现（若已启用）。"""
+        if event is not None and event.widget is not self.root:
+            return
+        if self.root.state() == "iconic":
+            return
+        self.pet_exited = False
+        if self.cfg.get("pet_enabled"):
+            self.root.after(200, self._show_pet)
+        else:
+            self._hide_pet()
+        self._sync_pet_base()
+
+    def _exit_pet(self) -> None:
+        """右键菜单「退出」：本次会话先隐藏桌宠，主窗口恢复时再出现。"""
+        self.pet_exited = True
+        self._hide_pet()
 
     def _on_topmost(self) -> None:
         v = bool(self.var_top.get())
@@ -1053,6 +1735,70 @@ class App:
             return bool(own) and ctypes.windll.user32.GetAncestor(fg, 2) == own
         except Exception:
             return False
+
+    def _ask_grip_press(self, event):
+        """按住提问框下边缘时，进入临时加高模式。"""
+        w = event.widget
+        try:
+            near_bottom = event.y >= w.winfo_height() - 8
+        except Exception:
+            near_bottom = False
+        if not near_bottom:
+            return None
+        self.ask_grip = {"y": event.y_root, "h": self.ask_h, "grab": w}
+        try:
+            w.grab_set()  # 拖出边缘也能持续收到移动/松开事件
+        except Exception:
+            pass
+        return "break"
+
+    def _ask_grip_move(self, event):
+        if not self.ask_grip:
+            return None
+        new_h = self.ask_grip["h"] + (event.y_root - self.ask_grip["y"])
+        self._set_ask_h(new_h, self.root.winfo_height(), allow_expand=True)
+        return "break"
+
+    def _ask_grip_release(self, event):
+        g = self.ask_grip
+        if not g:
+            return None
+        self.ask_grip = None
+        try:
+            g["grab"].grab_release()
+        except Exception:
+            pass
+        return "break"
+
+    def _ask_grip_cursor(self, event):
+        w = event.widget
+        try:
+            near_bottom = event.y >= w.winfo_height() - 8
+        except Exception:
+            near_bottom = False
+        try:
+            if self.ask_grip or near_bottom:
+                w.configure(cursor="sb_v_double_arrow")
+            else:
+                w.configure(cursor="xterm" if isinstance(w, tk.Text) else "")
+        except Exception:
+            pass
+
+    def _ask_grip_leave(self, event):
+        if self.ask_grip:
+            return
+        try:
+            event.widget.configure(cursor="xterm" if isinstance(event.widget, tk.Text) else "")
+        except Exception:
+            pass
+
+    def _ask_wheel(self, event):
+        """提问框内容超出可视区域时，用滚轮上下查看。"""
+        try:
+            self.txt_sel.yview_scroll(-3 if event.delta > 0 else 3, "units")
+        except Exception:
+            pass
+        return "break"
 
     def _ask_from_input(self, event=None):
         """在提问内容框里输入问题后按 Enter 直接发送。"""
@@ -1275,6 +2021,8 @@ class App:
                     self._show_error(data)
                 elif kind == "status" and gen == self.gen:
                     self.lbl_meta.config(text=data)
+                elif kind == "balance":
+                    self._finish_balance(data)
         except queue.Empty:
             pass
         except Exception:
@@ -1366,10 +2114,7 @@ class App:
         win.title("历史问答")
         win.configure(bg=BG)
         win.transient(self.root)
-        try:
-            win.iconbitmap(str(resource_path("app.ico")))
-        except Exception:
-            pass
+        self._apply_icon(win)
         win.minsize(480, 380)
 
         def on_close() -> None:
@@ -1667,10 +2412,7 @@ class App:
         win.configure(bg=BG)
         win.transient(self.root)
         win.resizable(False, False)
-        try:
-            win.iconbitmap(str(resource_path("app.ico")))
-        except Exception:
-            pass
+        self._apply_icon(win)
 
         # 设置窗口顶栏：与主窗口同款浅天蓝 + 金色竖条
         shead = tk.Frame(win, bg=HEADER_L, height=44)
@@ -1788,6 +2530,21 @@ class App:
             highlightthickness=0,
         ).pack(anchor="w", padx=14, pady=(8, 0))
 
+        v_pet = tk.BooleanVar(value=bool(self.cfg.get("pet_enabled")))
+        tk.Checkbutton(
+            win,
+            text="开启桌宠（桌面悬浮）",
+            variable=v_pet,
+            bg=BG,
+            fg=SUB,
+            activebackground=BG,
+            activeforeground=FG,
+            selectcolor=CARD,
+            font=(FONT, 9),
+            bd=0,
+            highlightthickness=0,
+        ).pack(anchor="w", padx=14, pady=(6, 0))
+
         tip = (
             "常用地址：\n"
             "DeepSeek  https://api.deepseek.com/v1  模型 deepseek-flash（V4.1）或 deepseek-v4-pro\n"
@@ -1831,6 +2588,12 @@ class App:
             except Exception:
                 self.cfg["doc_context_chars"] = DOC_BUDGET
             self.cfg["web_search"] = bool(v_web.get())
+            self.cfg["pet_enabled"] = bool(v_pet.get())
+            self.pet_exited = False
+            if self.cfg["pet_enabled"]:
+                self.root.after(120, self._show_pet)
+            else:
+                self._hide_pet()
             save_config(self.cfg)
             win.destroy()
             self.status.config(text="设置已保存 · 选词试试")
