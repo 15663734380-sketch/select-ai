@@ -2,7 +2,7 @@
 ; 安装到用户目录，无需管理员权限；桌面快捷方式可选。
 
 #define AppName "划词问答"
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.3"
 #define AppExe "划词问答.exe"
 
 [Setup]
@@ -34,6 +34,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\dist\划词问答\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\app.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\app_mascot.png"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\app.ico"

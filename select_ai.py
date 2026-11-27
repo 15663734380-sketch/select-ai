@@ -45,6 +45,8 @@ CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "error.log"
 HISTORY_PATH = APP_DIR / "history.json"
 HISTORY_MAX = 100    # 最多保留的历史问答条数
+FOOTER_HIDE_H = 540  # 窗口高度低于此值（逻辑像素）时折叠底部操作栏
+FOOTER_SHOW_H = 565  # 窗口高度回升到此值以上时恢复底部操作栏
 
 
 def resource_path(name: str) -> Path:
@@ -330,6 +332,7 @@ class App:
         self.win_rect = (0, 0, 0, 0)
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self._moved_by_self = False
+        self.footer_hidden = False
 
         # 文档上下文（加载后常驻内存，提问时检索相关片段随问题发送）
         self.doc_lock = threading.Lock()
@@ -645,6 +648,7 @@ class App:
         self.lbl_doc.pack(side="left", fill="x", expand=True, padx=(2, 8))
 
         body = tk.Frame(self.root, bg=BG)
+        self.body = body
         body.pack(fill="both", expand=True, padx=12, pady=(4, 0))
 
         # ---- 提问内容：白色圆角卡片，聚焦时边框变亮蓝
@@ -720,7 +724,8 @@ class App:
         self._setup_tags()
 
         footer = tk.Frame(self.root, bg=BG)
-        # 先于正文参与布局并贴底，窗口变矮时优先保留复制/清空与状态栏
+        self.footer = footer
+        # 先于正文参与布局并贴底；窗口高度不足时由 _on_root_configure 优先折叠隐藏
         footer.pack(side="bottom", fill="x", padx=14, pady=(6, 10), before=body)
 
         btn_clear = self._mkbtn(footer, "清空", self.clear_answer, font_size=8)
@@ -757,6 +762,24 @@ class App:
             arrowsize=12,
         )
         style.map("Ocean.Vertical.TScrollbar", background=[("active", "#b5d5f3")])
+        self.root.bind("<Configure>", self._on_root_configure)
+
+    def _on_root_configure(self, event) -> None:
+        """窗口变矮时先折叠底部操作栏，优先保证 AI 解答区可读。"""
+        if event.widget is not self.root:
+            return
+        h = event.height
+        try:
+            if not self.footer_hidden and h <= FOOTER_HIDE_H:
+                self.footer_hidden = True
+                self.footer.pack_forget()
+            elif self.footer_hidden and h >= FOOTER_SHOW_H:
+                self.footer_hidden = False
+                self.footer.pack(
+                    side="bottom", fill="x", padx=14, pady=(6, 10), before=self.body
+                )
+        except Exception:
+            log("底部操作栏折叠失败\n" + traceback.format_exc())
 
     def _setup_tags(self) -> None:
         self.txt_ans.tag_configure("h", font=(FONT, 11, "bold"), foreground=GOLD, spacing1=6, spacing3=4)
