@@ -2929,6 +2929,8 @@ class App:
             font=(FONT, 9),
             bd=0,
             highlightthickness=0,
+            wraplength=420,
+            justify="left",
         ).pack(anchor="w", padx=14, pady=(8, 0))
 
         v_pet = tk.BooleanVar(value=bool(self.cfg.get("pet_enabled")))
@@ -2961,15 +2963,16 @@ class App:
         self._mkbtn(btns, "保存", lambda: on_save(), primary=True).pack(side="right")
         self._mkbtn(btns, "取消", win.destroy).pack(side="right", padx=8)
 
-        # 按内容计算高度，确保「保存/取消」始终可见（高 DPI 下尤其重要）
+        # 按内容计算宽高，确保任何 DPI / 字体下勾选框与「保存/取消」都不会被挤掉
         win.update_idletasks()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = max(480, win.winfo_reqwidth() + 4)
         h = min(win.winfo_reqheight(), sh - 80)
         px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
         pw, ph = self.root.winfo_width(), self.root.winfo_height()
-        x = max(20, min(px + (pw - 480) // 2, sw - 480 - 20))
+        x = max(20, min(px + (pw - w) // 2, sw - w - 20))
         y = max(20, min(py + (ph - h) // 2, sh - h - 60))
-        win.geometry(f"480x{h}+{x}+{y}")
+        win.geometry(f"{w}x{h}+{x}+{y}")
         win.update()  # 先把内容绘制完成再显示，避免首帧深色底一闪
         win.deiconify()
         win.lift()
