@@ -109,7 +109,7 @@ MONO = "Consolas"
 
 DOC_CHUNK = 700      # 文档分块大小（字符）
 DOC_TOP_K = 4        # 每次最多引用的片段数
-DOC_BUDGET = 50000    # 每次随问题附带的文档片段总字数上限
+DOC_BUDGET = 100000    # 每次随问题附带的文档片段总字数上限
 
 HEADING_RE = re.compile(
     r"^(#{1,6}\s|第[一二三四五六七八九十百零两\d]+[章节篇部]|chapter\s+\d)",
@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {
     "doc_context_chars": DOC_BUDGET,
     "web_search": False,
     "last_doc_path": "",
+    "last_doc_paths": [],
     "topmost": True,
     "window_pos": None,
     "pet_enabled": False,
@@ -334,8 +335,8 @@ def _bigrams(s: str) -> set:
     return {s[i : i + 2] for i in range(len(s) - 1)}
 
 
-def retrieve_chunks(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: int = DOC_BUDGET) -> list:
-    """挑出与选中文字最相关的片段，按原文顺序返回。"""
+def retrieve_chunk_indices(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: int = DOC_BUDGET) -> list:
+    """挑出与选中文字最相关的片段下标，按原文顺序返回。"""
     if not chunks or budget <= 0:
         return []
     picked, total = [], 0
@@ -369,7 +370,12 @@ def retrieve_chunks(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: i
             picked.append(i)
             total += len(c)
     picked.sort()
-    return [chunks[i] for i in picked]
+    return picked
+
+
+def retrieve_chunks(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: int = DOC_BUDGET) -> list:
+    """挑出与选中文字最相关的片段，按原文顺序返回。"""
+    return [chunks[i] for i in retrieve_chunk_indices(query, chunks, grams, top_k, budget)]
 
 
 class App:
@@ -397,18 +403,32 @@ class App:
         self.balance_bubble = None
         self._bubble_after = None
         self._bubble_size = (0, 0)
+        self._bubble_anchor = (22, 0)
+        self._bubble_kind = "idle"
+        self._bubble_dib = None
+        self._bubble_hwnd = 0
+        self._bubble_alpha = 255
         self._fade_start = None
+        self._fade_mode = "out"
         self._pet_menu_obj = None
         self.pet_anim = None
         self.tray = None
         self._egg_after = None
+        self._idle_first = True
+        self._idle_bag = []
+        self._idle_followup = None
+        self._last_idle_text = ""
         self.ask_grip = None
 
-        # 文档上下文（加载后常驻内存，提问时检索相关片段随问题发送）
+        # 文档上下文（支持一次加载多个文档并常驻内存，提问时跨文档检索相关片段）
         self.doc_lock = threading.Lock()
+        self.doc_gen = 0
+        self.docs = []
         self.doc_path = None
         self.doc_text = ""
+        self.doc_total_chars = 0
         self.doc_chunks = ()
+        self.doc_sources = ()
         self.doc_grams = ()
         self.doc_mtime = 0.0
 
@@ -1373,9 +1393,9 @@ class App:
 
     # ------------------------------------------------------------ 文档上下文
     def choose_doc(self) -> None:
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             parent=self.root,
-            title="选择要作为参考的文档",
+            title="选择要作为参考的文档（可多选）",
             filetypes=[
                 ("支持的文档", "*.pdf *.docx *.txt *.md *.markdown"),
                 ("PDF", "*.pdf"),
@@ -1388,55 +1408,124 @@ class App:
                 ("所有文件", "*.*"),
             ],
         )
-        if path:
-            self.load_document(Path(path))
+        if paths:
+            self.load_documents([Path(p) for p in paths])
 
     def _autoload_doc(self) -> None:
-        raw = (self.cfg.get("last_doc_path") or "").strip()
-        if not raw:
-            return
-        p = Path(raw)
-        if p.is_file():
-            self.load_document(p, quiet=True)
+        raw_list = self.cfg.get("last_doc_paths")
+        candidates = []
+        if isinstance(raw_list, list) and raw_list:
+            candidates = [Path(str(p).strip()) for p in raw_list if str(p).strip()]
         else:
+            raw = (self.cfg.get("last_doc_path") or "").strip()
+            if raw:
+                candidates = [Path(raw)]
+        if not candidates:
+            return
+        valid = [p for p in candidates if p.is_file()]
+        if valid:
+            if len(valid) != len(candidates):
+                self.cfg["last_doc_paths"] = [str(p) for p in valid]
+                self.cfg["last_doc_path"] = str(valid[0])
+                save_config(self.cfg)
+            self.load_documents(valid, quiet=True)
+        else:
+            self.cfg["last_doc_paths"] = []
             self.cfg["last_doc_path"] = ""
             save_config(self.cfg)
 
+    def _rebuild_doc_index(self) -> None:
+        """根据 self.docs 重建扁平检索索引（调用方需持有 self.doc_lock）。"""
+        chunks = []
+        sources = []
+        grams = []
+        total_chars = 0
+        for d in self.docs:
+            total_chars += len(d["text"])
+            chunks.extend(d["chunks"])
+            sources.extend([d["name"]] * len(d["chunks"]))
+            grams.extend(d["grams"])
+        self.doc_chunks = tuple(chunks)
+        self.doc_sources = tuple(sources)
+        self.doc_grams = tuple(grams)
+        self.doc_total_chars = total_chars
+        if self.docs:
+            self.doc_path = self.docs[0]["path"]
+            self.doc_mtime = self.docs[0]["mtime"]
+            self.doc_text = self.docs[0]["text"] if len(self.docs) == 1 else ""
+        else:
+            self.doc_path = None
+            self.doc_mtime = 0.0
+            self.doc_text = ""
+
     def load_document(self, path: Path, quiet: bool = False) -> None:
-        name = path.name
-        self.lbl_doc.config(text=f"正在解析 {name[:14]}…", fg=SUB)
-        if not quiet:
-            self.status.config(text=f"正在解析文档：{name}")
+        self.load_documents([path], quiet=quiet)
+
+    def load_documents(self, paths: list, quiet: bool = False) -> None:
+        unique = []
+        seen = set()
+        for p in paths:
+            p = Path(p)
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+        if not unique:
+            return
+        self.doc_gen += 1
+        dgen = self.doc_gen
+        if len(unique) == 1:
+            name = unique[0].name
+            self.lbl_doc.config(text=f"正在解析 {name[:12]}…", fg=SUB)
+            if not quiet:
+                self.status.config(text=f"正在解析文档：{name}")
+        else:
+            self.lbl_doc.config(text=f"正在解析 {len(unique)} 个文档…", fg=SUB)
+            if not quiet:
+                self.status.config(text=f"正在解析 {len(unique)} 个文档…")
         self.btn_doc.config(state="disabled")
 
         def work():
-            try:
-                text = normalize_text(read_document(path))
-            except Exception as e:
-                self.msg_q.put(("doc_error", 0, f"{name} 解析失败：{e}"))
-                return
-            if not text.strip():
-                self.msg_q.put(
-                    ("doc_error", 0, f"{name} 里没有提取到文字（扫描版 PDF 需先 OCR）")
-                )
-                return
-            try:
-                chunks = tuple(split_chunks(text))
-                grams = tuple(_bigrams(c) for c in chunks)
-                mtime = path.stat().st_mtime
-            except Exception as e:
-                self.msg_q.put(("doc_error", 0, f"{name} 解析失败：{e}"))
-                return
-            self.msg_q.put(
-                (
-                    "doc",
-                    0,
+            docs = []
+            failed = []
+            for path in unique:
+                name = path.name
+                try:
+                    text = normalize_text(read_document(path))
+                except Exception as e:
+                    failed.append(f"{name}（{e}）")
+                    continue
+                if not text.strip():
+                    failed.append(f"{name}（未提取到文字）")
+                    continue
+                try:
+                    chunks = tuple(split_chunks(text))
+                    grams = tuple(_bigrams(c) for c in chunks)
+                    mtime = path.stat().st_mtime
+                except Exception as e:
+                    failed.append(f"{name}（{e}）")
+                    continue
+                docs.append(
                     {
                         "path": path,
+                        "name": name,
                         "text": text,
                         "chunks": chunks,
                         "grams": grams,
                         "mtime": mtime,
+                    }
+                )
+            if not docs:
+                msg = "；".join(failed) if failed else "未选择有效文档"
+                self.msg_q.put(("doc_error", dgen, msg))
+                return
+            self.msg_q.put(
+                (
+                    "doc",
+                    dgen,
+                    {
+                        "docs": docs,
+                        "failed": failed,
                         "quiet": quiet,
                     },
                 )
@@ -1444,27 +1533,37 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_doc_loaded(self, info: dict) -> None:
+    def _on_doc_loaded(self, info: dict, dgen: int = 0) -> None:
+        if dgen and dgen != self.doc_gen:
+            return
+        docs = info["docs"]
+        failed = info.get("failed") or []
         with self.doc_lock:
-            self.doc_path = info["path"]
-            self.doc_text = info["text"]
-            self.doc_chunks = info["chunks"]
-            self.doc_grams = info["grams"]
-            self.doc_mtime = info["mtime"]
-        self.cfg["last_doc_path"] = str(info["path"])
+            self.docs = list(docs)
+            self._rebuild_doc_index()
+        self.cfg["last_doc_paths"] = [str(d["path"]) for d in docs]
+        self.cfg["last_doc_path"] = str(docs[0]["path"])
         save_config(self.cfg)
         self.btn_doc.config(state="normal", text="换文档")
         if not self.btn_doc_clear.winfo_manager():
             self.btn_doc_clear.pack(side="right", padx=(0, 4), before=self.lbl_doc)
         self._update_doc_label()
+        if failed:
+            log("部分文档加载跳过：" + "；".join(failed))
         if not info.get("quiet"):
-            self.status.config(
-                text=f"已加载 {info['path'].name[:16]} · 回答优先依据文档"
-            )
+            if len(docs) == 1:
+                tip = f"已加载 {docs[0]['name'][:16]} · 回答优先依据文档"
+            else:
+                tip = f"已加载 {len(docs)} 个文档 · 回答优先依据文档"
+            if failed:
+                tip += f"（跳过 {len(failed)} 个）"
+            self.status.config(text=tip)
 
-    def _on_doc_error(self, msg: str) -> None:
+    def _on_doc_error(self, msg: str, dgen: int = 0) -> None:
+        if dgen and dgen != self.doc_gen:
+            return
         self.btn_doc.config(state="normal")
-        if self.doc_path:
+        if self.docs:
             self.btn_doc.config(text="换文档")
             self._update_doc_label()
         else:
@@ -1474,12 +1573,11 @@ class App:
         log(msg)
 
     def remove_doc(self) -> None:
+        self.doc_gen += 1
         with self.doc_lock:
-            self.doc_path = None
-            self.doc_text = ""
-            self.doc_chunks = ()
-            self.doc_grams = ()
-            self.doc_mtime = 0.0
+            self.docs = []
+            self._rebuild_doc_index()
+        self.cfg["last_doc_paths"] = []
         self.cfg["last_doc_path"] = ""
         save_config(self.cfg)
         self.btn_doc.config(text="加载文档")
@@ -1489,58 +1587,74 @@ class App:
 
     def _update_doc_label(self) -> None:
         with self.doc_lock:
-            path = self.doc_path
-            total = len(self.doc_text)
+            n_docs = len(self.docs)
+            first_name = self.docs[0]["name"] if self.docs else ""
+            total = self.doc_total_chars
             count = len(self.doc_chunks)
-        if not path:
+        if not n_docs:
             self.lbl_doc.config(text="未加载文档 · 回答基于通用知识", fg=SUB)
             return
-        name = path.name
-        if len(name) > 10:
-            name = name[:9] + "…"
-        self.lbl_doc.config(text=f"{name} · {total:,} 字 · {count} 段", fg=TEXT_SOFT)
+        if n_docs == 1:
+            name = first_name if len(first_name) <= 10 else first_name[:9] + "…"
+            self.lbl_doc.config(text=f"{name} · {total:,} 字 · {count} 段", fg=TEXT_SOFT)
+        else:
+            self.lbl_doc.config(text=f"已加载 {n_docs} 个文档 · {total:,} 字 · {count} 段", fg=TEXT_SOFT)
 
     def _refresh_doc_if_needed(self) -> None:
         """文档被外部修改保存后，提问时自动重新解析（在后台线程调用）。"""
         with self.doc_lock:
-            path = self.doc_path
-            old_mtime = self.doc_mtime
-        if not path:
+            snap = [(i, d["path"], d["mtime"]) for i, d in enumerate(self.docs)]
+        if not snap:
             return
-        try:
-            mtime = path.stat().st_mtime
-        except Exception:
+        changed = []
+        for idx, path, old_mtime in snap:
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                continue
+            if abs(mtime - old_mtime) < 1e-6:
+                continue
+            try:
+                text = normalize_text(read_document(path))
+                if not text.strip():
+                    continue
+                chunks = tuple(split_chunks(text))
+                grams = tuple(_bigrams(c) for c in chunks)
+                changed.append((idx, path, text, chunks, grams, mtime))
+            except Exception:
+                log(f"文档自动重新解析失败（{path.name}）\n" + traceback.format_exc())
+        if not changed:
             return
-        if abs(mtime - old_mtime) < 1e-6:
-            return
-        try:
-            text = normalize_text(read_document(path))
-            if not text.strip():
-                return
-            chunks = tuple(split_chunks(text))
-            grams = tuple(_bigrams(c) for c in chunks)
-            with self.doc_lock:
-                self.doc_text = text
-                self.doc_chunks = chunks
-                self.doc_grams = grams
-                self.doc_mtime = mtime
-            log(f"文档已变化，自动重新解析：{path.name}")
-        except Exception:
-            log("文档自动重新解析失败\n" + traceback.format_exc())
+        with self.doc_lock:
+            for idx, path, text, chunks, grams, mtime in changed:
+                if idx < len(self.docs) and self.docs[idx]["path"] == path:
+                    self.docs[idx]["text"] = text
+                    self.docs[idx]["chunks"] = chunks
+                    self.docs[idx]["grams"] = grams
+                    self.docs[idx]["mtime"] = mtime
+                    log(f"文档已变化，自动重新解析：{path.name}")
+            self._rebuild_doc_index()
 
-    def _pick_doc_chunks(self, query: str) -> list:
+    def _pick_doc_chunks(self, query: str) -> tuple:
         try:
             budget = int(self.cfg.get("doc_context_chars", DOC_BUDGET))
         except Exception:
             budget = DOC_BUDGET
         if budget <= 0:
-            return []
+            return [], ()
         # 引用片段数随预算放大，避免调大字数后仍只取 4 段
         top_k = max(DOC_TOP_K, budget // DOC_CHUNK + 2)
         with self.doc_lock:
             chunks = self.doc_chunks
+            sources = self.doc_sources
             grams = self.doc_grams
-        return retrieve_chunks(query, chunks, grams, top_k, budget)
+            doc_names = tuple(d["name"] for d in self.docs)
+        indices = retrieve_chunk_indices(query, chunks, grams, top_k, budget)
+        if len(doc_names) > 1:
+            picked = [f"【{sources[i]}】\n{chunks[i]}" for i in indices]
+        else:
+            picked = [chunks[i] for i in indices]
+        return picked, doc_names
 
     # ------------------------------------------------------------ 监听状态
     def toggle_listen(self) -> None:
@@ -1609,19 +1723,121 @@ class App:
         if self.pet_anim is not None:
             self.pet_anim.trigger(state, hold)
 
+    # ------------------------------------------------------------ 发呆语料与自然节奏
+    IDLE_CORPUS = (
+        "好无聊啊…",
+        "好饿啊…",
+        "唔…好无聊，想转圈圈…",
+        "盯——（放空发呆中）",
+        "呼啊…有点犯困了…",
+        "发呆也是一种节能模式哦…",
+        "尾巴摇着摇着，就忘了刚才在想什么…",
+        "今天的海水好像格外安静呢…",
+        "数羊中…一只鲸鱼、两只鲸鱼…",
+        "放大镜里好像什么也没有动静…",
+        "呜…没人陪我玩的话我就继续冒泡啦",
+        "噗噜噗噜…（吐泡泡）",
+        "刚才好像有小星星闪过去了？错觉吗…",
+        "肚子好像在咕噜咕噜叫了…",
+        "好想吃香喷喷的小鱼干…",
+        "现在要是能喝到一口冰奶茶就好了…",
+        "呜，饿得放大镜都快拿不动了…",
+        "今天下一顿吃什么好呢…",
+        "好想啃一块海盐芝士小蛋糕…",
+        "好像闻到了好吃的味道…（其实是幻觉）",
+        "有认真学习吗？",
+        "看得累了的话，记得眨眨眼休息一下哦",
+        "遇到看不懂的句子，随时划词问我呀～",
+        "坐太久啦，要不要起来伸个懒腰？",
+        "偷偷看你一眼…嗯，继续加油！",
+        "我的放大镜随时待命，有需要就点我哦～",
+        "记得喝口水润润嗓子呀",
+        "一点点积累起来，已经进步很多啦",
+        "小鲸鱼游啊游…游到桌面角落休息…",
+        "头上的蕾丝发箍歪了没有呀？",
+        "用放大镜追鼠标指针，好像在捉萤火虫",
+        "好想潜回深海里打个滚…",
+        "听说认真的人身上会发光，我用放大镜瞧瞧！",
+        "要是我靠着桌面睡着了，记得轻轻叫醒我哦",
+        "外面的云飘得好慢呀…",
+        "晃晃小鲸尾～心情变好一点了吗？",
+        "呼…把烦恼装进泡泡里吹走吧",
+    )
+
+    IDLE_FOLLOWUPS = {
+        "好无聊啊…": ("没人理我的话，就自己吐泡泡玩好啦…", "噗噜…噗噜…（自言自语中）"),
+        "好饿啊…": ("好想吃香喷喷的小鱼干…", "是不是该去觅食补充能量了呀？"),
+        "呼啊…有点犯困了…": ("再眯三秒钟…就三秒…", "唔，打起精神来！"),
+        "今天下一顿吃什么好呢…": ("想喝热乎乎的浓汤配小面包…",),
+    }
+
+    def _pick_idle_line(self) -> str:
+        """从发呆语料库抽取不连续重复的台词，并按时段混入贴近生活的问候。"""
+        if self._idle_followup:
+            line = self._idle_followup
+            self._idle_followup = None
+            self._last_idle_text = line
+            return line
+
+        if not self._idle_bag:
+            pool = list(self.IDLE_CORPUS)
+            h = datetime.now().hour
+            if 6 <= h < 11:
+                pool.extend(("早安～今天也要元气满满呀", "早上好！有没有乖乖吃早饭呀？"))
+            elif 11 <= h < 14:
+                pool.extend(("到午饭时间啦，好饿啊，先去吃饭吧～", "中午吃完饭小憩一会儿也不错呢"))
+            elif 14 <= h < 17:
+                pool.extend(("下午有点犯困了…喝口水提提神吧", "下午茶时间到，好想吃小甜点…"))
+            elif h >= 22 or h < 5:
+                pool.extend(("夜深啦，早点休息不要熬太晚哦", "好困…星星都要睡着了，你也早点睡吧"))
+            random.shuffle(pool)
+            if len(pool) > 1 and pool[-1] == self._last_idle_text:
+                pool[0], pool[-1] = pool[-1], pool[0]
+            self._idle_bag = pool
+
+        line = self._idle_bag.pop()
+        self._last_idle_text = line
+        choices = self.IDLE_FOLLOWUPS.get(line)
+        if choices and random.random() < 0.35:
+            self._idle_followup = random.choice(choices)
+        return line
+
     def _sync_pet_base(self) -> None:
-        """桌宠的基础形态跟随主窗口：最小化时发呆，否则认真观察。"""
-        idle = self.root.state() == "iconic"
+        """桌宠的基础形态跟随主窗口：最小化或托盘隐藏时发呆，否则认真观察。"""
+        idle = self.root.state() in ("iconic", "withdrawn")
         if self.pet_anim is not None:
             self.pet_anim.set_base("idle" if idle else "observe")
-        self._schedule_egg()
+        if idle:
+            self._idle_first = True
+            self._schedule_egg()
+        else:
+            self._cancel_egg()
+            if self._bubble_kind == "idle":
+                self._hide_balance_bubble()
 
-    def _schedule_egg(self) -> None:
-        """发呆彩蛋：主窗口最小化期间，随机 2 分钟到 1 小时后冒一句「有认真学习吗」。"""
+    def _schedule_egg(self, delay_s: float = None) -> None:
+        """模拟真人发呆节奏：首次进入发呆后较快冒话，后续在长短不等的随机间隔间自然触发。"""
         self._cancel_egg()
-        if self.pet is None or self.pet_anim is None or self.root.state() != "iconic":
+        if (
+            self.pet is None
+            or self.pet_anim is None
+            or self.root.state() not in ("iconic", "withdrawn")
+        ):
             return
-        self._egg_after = self.root.after(random.randint(120, 3600) * 1000, self._egg_fire)
+        if delay_s is None:
+            if self._idle_first:
+                delay_s = random.uniform(12.0, 30.0)
+            elif self._idle_followup:
+                delay_s = random.uniform(14.0, 26.0)
+            else:
+                r = random.random()
+                if r < 0.22:
+                    delay_s = random.uniform(22.0, 42.0)   # 偶尔连着碎碎念两句
+                elif r < 0.82:
+                    delay_s = random.uniform(50.0, 145.0)  # 常态自然放空间隔
+                else:
+                    delay_s = random.uniform(160.0, 320.0) # 偶尔安静久一点再冒泡
+        self._egg_after = self.root.after(int(delay_s * 1000), self._egg_fire)
 
     def _cancel_egg(self) -> None:
         if self._egg_after is not None:
@@ -1633,9 +1849,25 @@ class App:
 
     def _egg_fire(self) -> None:
         self._egg_after = None
-        if self.pet is None or self.root.state() != "iconic":
+        if (
+            self.pet is None
+            or self.pet_anim is None
+            or self.root.state() not in ("iconic", "withdrawn")
+        ):
             return
-        self._show_balance_bubble("有认真学习吗", stay_ms=4000)
+        # 正在拖放、悬停互动或查询/显示余额时不打断，稍后再试
+        if (
+            self.balance_loading
+            or self.balance_bubble is not None
+            or self.pet_drag is not None
+            or self.pet_anim.hovering
+        ):
+            self._schedule_egg(delay_s=random.uniform(12.0, 24.0))
+            return
+        self._idle_first = False
+        line = self._pick_idle_line()
+        stay_ms = max(3400, min(5000, 2800 + len(line) * 95))
+        self._show_balance_bubble(line, stay_ms=stay_ms, kind="idle")
         self._schedule_egg()
 
     def _pet_motion(self, event) -> None:
@@ -1854,13 +2086,13 @@ class App:
         self._pet_trigger("money")
         key = (self.cfg.get("api_key") or "").strip()
         if not key:
-            self._show_balance_bubble("请先在设置中填写 API Key")
+            self._show_balance_bubble("请先在设置中填写 API Key", kind="balance")
             return
         if "api.deepseek.com" not in str(self.cfg.get("base_url") or ""):
-            self._show_balance_bubble("当前接口无法查询余额\n仅支持 DeepSeek 官方接口")
+            self._show_balance_bubble("当前接口无法查询余额\n仅支持 DeepSeek 官方接口", kind="balance")
             return
         self.balance_loading = True
-        self._show_balance_bubble("正在查询余额…")
+        self._show_balance_bubble("正在查询余额…", kind="balance")
 
         def work() -> None:
             msg = ""
@@ -1910,95 +2142,335 @@ class App:
         self._pet_trigger("money")
         if self.pet is None:
             return
-        self._show_balance_bubble(msg)
+        self._show_balance_bubble(msg, stay_ms=3800, kind="balance")
 
-    def _show_balance_bubble(self, text: str, stay_ms: int = 3000) -> None:
-        """透明圆角气泡，定位在桌宠左上角。"""
+    @staticmethod
+    def _bubble_win32():
+        """独立的 Win32 LayeredWindow API 句柄，避免修改全局 windll 签名。"""
+        u = ctypes.WinDLL("user32")
+        g = ctypes.WinDLL("gdi32")
+
+        class BIH(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD), ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.c_long), ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD),
+            ]
+
+        class BI(ctypes.Structure):
+            _fields_ = [("bmiHeader", BIH), ("bmiColors", wintypes.DWORD * 1)]
+
+        class BLEND(ctypes.Structure):
+            _fields_ = [
+                ("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
+                ("SourceConstantAlpha", ctypes.c_byte), ("AlphaFormat", ctypes.c_byte),
+            ]
+
+        u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        u.GetDC.restype = ctypes.c_void_p
+        u.GetDC.argtypes = [wintypes.HWND]
+        u.ReleaseDC.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u.UpdateLayeredWindow.restype = wintypes.BOOL
+        u.UpdateLayeredWindow.argtypes = [
+            wintypes.HWND, ctypes.c_void_p, ctypes.POINTER(wintypes.POINT),
+            ctypes.POINTER(wintypes.SIZE), ctypes.c_void_p, ctypes.POINTER(wintypes.POINT),
+            wintypes.COLORREF, ctypes.POINTER(BLEND), wintypes.DWORD,
+        ]
+        g.CreateCompatibleDC.restype = ctypes.c_void_p
+        g.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        g.CreateDIBSection.restype = ctypes.c_void_p
+        g.CreateDIBSection.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(BI), wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, wintypes.DWORD,
+        ]
+        g.SelectObject.restype = ctypes.c_void_p
+        g.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        g.DeleteObject.argtypes = [ctypes.c_void_p]
+        g.DeleteDC.argtypes = [ctypes.c_void_p]
+        return u, g, BIH, BI, BLEND
+
+    def _render_bubble_image(self, text: str, kind: str = "balance"):
+        """用 4 倍超采样绘制鲸鱼娘气泡：柔阴影 + 珍珠渐变底 + 无接缝细边 + 徽章 + 清晰文字。"""
+        from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+        sc = self.ui
+        font_px = max(12, int(round(13 * sc)))
+        font_name = "msyhbd.ttc" if kind == "balance" else "msyh.ttc"
+        try:
+            font = ImageFont.truetype(font_name, font_px)
+        except Exception:
+            try:
+                font = ImageFont.truetype("msyh.ttc", font_px)
+            except Exception:
+                font = ImageFont.load_default()
+
+        lines = text.split("\n")
+        tmp_draw = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+        line_boxes = [tmp_draw.textbbox((0, 0), ln or " ", font=font) for ln in lines]
+        line_ws = [b[2] - b[0] for b in line_boxes]
+        ascent_pad = max(2, int(round(font_px * 1.38)))
+        tw = max(line_ws) if line_ws else int(40 * sc)
+        th = ascent_pad * len(lines)
+
+        badge_sz = max(14, int(round(16 * sc)))
+        badge_gap = max(6, int(round(7 * sc)))
+        pad_l = max(10, int(round(11 * sc)))
+        pad_r = max(12, int(round(13 * sc)))
+        pad_v = max(8, int(round(9 * sc)))
+        bw = pad_l + badge_sz + badge_gap + tw + pad_r
+        bh = max(badge_sz + pad_v * 2, th + pad_v * 2)
+
+        sp = max(6, int(round(7 * sc)))     # 四周柔阴影安全边距
+        tail_h = max(9, int(round(10 * sc)))
+        cw = bw + sp * 2
+        ch = bh + tail_h + sp * 2
+        rad = max(10, int(round(12 * sc)))
+
+        S = 4
+        W, H = cw * S, ch * S
+        x0, y0 = sp * S, sp * S
+        x1, y1 = (sp + bw) * S, (sp + bh) * S
+        tail_anchor_x = x1 - max(18, int(round(20 * sc))) * S
+        tip_x = tail_anchor_x + int(round(11 * sc)) * S
+        tip_y = y1 + tail_h * S
+
+        # 弯曲小尾巴（向右下方指向鲸鱼娘头顶左上角）
+        tail_pts = [
+            (tail_anchor_x - int(round(10 * sc)) * S, y1 - 2 * S),
+            (tail_anchor_x - int(round(4 * sc)) * S, y1 + int(round(4.5 * sc)) * S),
+            (tip_x, tip_y),
+            (tail_anchor_x + int(round(4 * sc)) * S, y1 + int(round(3.5 * sc)) * S),
+            (tail_anchor_x + int(round(6 * sc)) * S, y1 - 2 * S),
+        ]
+
+        # 1. 外轮廓遮罩 + 柔阴影层
+        outer = Image.new("L", (W, H), 0)
+        od = ImageDraw.Draw(outer)
+        od.rounded_rectangle([x0, y0, x1, y1], radius=rad * S, fill=255)
+        od.polygon(tail_pts, fill=255)
+
+        shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sh_alpha = outer.point(lambda v: int(v * 0.24))
+        sh_layer = Image.new("RGBA", (W, H), (64, 98, 162, 255))
+        sh_layer.putalpha(sh_alpha)
+        shadow.paste(sh_layer, (0, int(round(2.5 * sc)) * S))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=2.6 * sc * S))
+
+        # 2. 气泡边框与内部渐层（使用腐蚀遮罩让边框沿圆角和尾巴一气呵成、无接缝）
+        bw_px = max(4, int(round(1.3 * sc * S)))
+        k_size = bw_px * 2 + 1
+        inner = outer.filter(ImageFilter.MinFilter(k_size))
+
+        if kind == "balance":
+            edge_rgb = (204, 154, 58)    # 香槟暖金边（呼应元宝与放大镜）
+            top_rgb = (255, 254, 249)    # 暖珍珠白
+            bot_rgb = (250, 243, 224)    # 淡香槟奶霜
+            glow_rgb = (253, 240, 200)
+            star_rgb = (206, 142, 26)
+            dot_rgb = (242, 194, 78)
+        else:
+            edge_rgb = (122, 166, 228)   # 鲸尾天蓝边（呼应 UI 色系）
+            top_rgb = (255, 255, 255)    # 珍珠白
+            bot_rgb = (232, 242, 254)    # 柔冰蓝
+            glow_rgb = (224, 239, 254)
+            star_rgb = (78, 140, 230)
+            dot_rgb = (132, 184, 246)
+
+        border_img = Image.new("RGBA", (W, H), edge_rgb + (255,))
+        border_img.putalpha(outer)
+
+        grad = Image.new("RGBA", (W, H))
+        gd = ImageDraw.Draw(grad)
+        span = max(1, (y1 + tail_h * S) - y0)
+        for yy in range(y0, min(H, y1 + tail_h * S + 2)):
+            t = min(1.0, max(0.0, (yy - y0) / span))
+            col = tuple(int(top_rgb[i] + (bot_rgb[i] - top_rgb[i]) * t) for i in range(3)) + (255,)
+            gd.line([(0, yy), (W, yy)], fill=col)
+        grad.putalpha(inner)
+
+        # 顶部 1px 内高光，增加通透玻璃质感
+        hi = Image.new("L", (W, H), 0)
+        hd = ImageDraw.Draw(hi)
+        hd.rounded_rectangle(
+            [x0 + bw_px, y0 + bw_px, x1 - bw_px, y1 - bw_px],
+            radius=max(4, rad * S - bw_px), outline=210, width=max(2, int(S * 0.9)),
+        )
+        hi_crop = Image.new("L", (W, H), 0)
+        hi_crop.paste(hi.crop((0, 0, W, y0 + rad * S)), (0, 0))
+        hi_layer = Image.new("RGBA", (W, H), (255, 255, 255, 255))
+        hi_layer.putalpha(hi_crop)
+
+        # 3. 左侧小徽章（4 倍超采样，四角星光 + 小圆点/气泡）
+        bcx = (sp + pad_l + badge_sz * 0.5) * S
+        bcy = (sp + bh * 0.5) * S
+        gr = badge_sz * 0.52 * S
+        bd = ImageDraw.Draw(grad)
+        bd.ellipse([bcx - gr, bcy - gr, bcx + gr, bcy + gr], fill=glow_rgb + (255,))
+        sr = badge_sz * 0.36 * S
+        sk = sr * 0.32
+        s_pts = [
+            (bcx, bcy - sr), (bcx + sk, bcy - sk), (bcx + sr, bcy), (bcx + sk, bcy + sk),
+            (bcx, bcy + sr), (bcx - sk, bcy + sk), (bcx - sr, bcy), (bcx - sk, bcy - sk),
+        ]
+        bd.polygon(s_pts, fill=star_rgb + (255,))
+        dr = badge_sz * 0.13 * S
+        dx_c, dy_c = bcx + sr * 0.72, bcy - sr * 0.68
+        bd.ellipse([dx_c - dr, dy_c - dr, dx_c + dr, dy_c + dr], fill=dot_rgb + (255,))
+
+        comp = Image.alpha_composite(shadow, border_img)
+        comp = Image.alpha_composite(comp, grad)
+        comp = Image.alpha_composite(comp, hi_layer)
+        # 先预乘 alpha 再缩回 1x，保证边缘平滑无黑边
+        final_img = comp.convert("RGBa").resize((cw, ch), Image.LANCZOS).convert("RGBA")
+
+        # 4. 1x 原生分辨率绘制深墨文字（清晰锐利）
+        td = ImageDraw.Draw(final_img)
+        tx_start = sp + pad_l + badge_sz + badge_gap
+        ty_start = sp + (bh - th) // 2
+        ink = (17, 27, 51, 255)
+        for i, (ln, lb) in enumerate(zip(lines, line_boxes)):
+            lh = lb[3] - lb[1]
+            y_off = ty_start + i * ascent_pad + (ascent_pad - lh) // 2 - lb[1]
+            td.text((tx_start - lb[0], y_off), ln, font=font, fill=ink)
+
+        tail_anchor_1x = (int(round(tip_x / S)), int(round(tip_y / S)))
+        return final_img, (cw, ch), tail_anchor_1x
+
+    def _free_bubble_dib(self) -> None:
+        if self._bubble_dib is None:
+            return
+        try:
+            _, g, _, _, _ = self._bubble_win32()
+            _, hbmp, mdc, _ = self._bubble_dib
+            g.DeleteDC(mdc)
+            g.DeleteObject(hbmp)
+        except Exception:
+            pass
+        self._bubble_dib = None
+
+    def _push_bubble_alpha(self, alpha_byte: int) -> None:
+        """通过 UpdateLayeredWindow 以逐像素透明 + 整体 alpha 刷新气泡，无洋红锯齿边。"""
+        if not self._bubble_hwnd or self._bubble_dib is None:
+            return
+        try:
+            u, _, _, _, BLEND = self._bubble_win32()
+            (cw, ch), _, mdc, _ = self._bubble_dib
+            size = wintypes.SIZE(cw, ch)
+            src = wintypes.POINT(0, 0)
+            blend = BLEND(0, 0, max(0, min(255, int(alpha_byte))), 1)
+            u.UpdateLayeredWindow(
+                self._bubble_hwnd, None, None, ctypes.byref(size), mdc,
+                ctypes.byref(src), 0, ctypes.byref(blend), 0x02,
+            )
+            self._bubble_alpha = alpha_byte
+        except Exception:
+            pass
+
+    def _show_balance_bubble(self, text: str, stay_ms: int = 3000, kind: str = "balance") -> None:
+        """鲸鱼娘精致对话气泡：逐像素抗锯齿分层窗口，支持余额展示与发呆冒泡。"""
         self._hide_balance_bubble()
         if self.pet is None:
             return
         try:
-            import tkinter.font as tkfont
-
-            font = tkfont.Font(family=FONT, size=10)
-            lines = text.split("\n")
-            tw = max(font.measure(line) for line in lines)
-            th = font.metrics("linespace") * len(lines)
-            bw, bh = tw + 28, th + 18
-            tail = 10
-            key = "#ff00fe"
-            cw, ch = bw + 2, bh + tail + 2
+            img, (cw, ch), (ax, ay) = self._render_bubble_image(text, kind=kind)
             win = tk.Toplevel(self.root)
             win.withdraw()
             win.overrideredirect(True)
             win.attributes("-topmost", False)
-            win.configure(bg=key)
-            try:
-                win.attributes("-transparentcolor", key)
-            except Exception:
-                pass
-            cv = tk.Canvas(win, width=cw, height=ch, bg=key, highlightthickness=0, bd=0)
-            cv.pack()
-            r = 10
-            x0, y0, x1, y1 = 1, 1, bw - 1, bh - 1
-            pts = [
-                x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0,
-                x1, y0 + r, x1, y1 - r, x1, y1 - r, x1, y1,
-                x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1,
-                x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0,
-            ]
-            cv.create_polygon(
-                pts, smooth=True, splinesteps=24, fill=CARD, outline=BORDER, width=1
-            )
-            tx = x1 - 26
-            cv.create_polygon(
-                tx, y1 - 1, tx + 14, y1 - 1, x1 - 6, y1 + tail,
-                fill=CARD, outline="",
-            )
-            cv.create_text(
-                (x0 + x1) // 2, (y0 + y1) // 2,
-                text=text, fill=FG, font=font, justify="left",
-            )
-            cv.bind("<Button-1>", lambda e: self._hide_balance_bubble())
+
             px, py, _, _ = self._pet_rect()
-            bx = px + 14 - cw
-            by = py - ch - 2
+            bx = px + int(self.pet_size * 0.22) - ax
+            by = py + int(self.pet_size * 0.08) - ay
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
             bx = max(4, min(bx, sw - cw - 4))
             by = max(4, min(by, sh - ch - 4))
             win.geometry(f"{cw}x{ch}+{bx}+{by}")
             win.update_idletasks()
-            win.deiconify()
-            win.lift()
-            try:
-                win.attributes("-alpha", 1.0)
-            except Exception:
-                pass
+
+            hwnd = self._hwnd(win)
+            u, g, BIH, BI, _ = self._bubble_win32()
+            st_ex = u.GetWindowLongPtrW(hwnd, -20)
+            u.SetWindowLongPtrW(hwnd, -20, st_ex | 0x00080000)  # WS_EX_LAYERED
+
+            hdc = u.GetDC(None)
+            bmi = BI()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BIH)
+            bmi.bmiHeader.biWidth = cw
+            bmi.bmiHeader.biHeight = -ch
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bits = ctypes.c_void_p()
+            hbmp = g.CreateDIBSection(hdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            u.ReleaseDC(None, hdc)
+            if not hbmp or not bits.value:
+                raise OSError("CreateDIBSection failed for bubble")
+            mdc = g.CreateCompatibleDC(None)
+            g.SelectObject(mdc, hbmp)
+            pm = img.convert("RGBa")
+            r_ch, g_ch, b_ch, a_ch = pm.split()
+            from PIL import Image
+            raw = Image.merge("RGBa", (b_ch, g_ch, r_ch, a_ch)).tobytes()
+            ctypes.memmove(bits, raw, len(raw))
+
             self.balance_bubble = win
             self._bubble_size = (cw, ch)
-            self._fade_start = None
-            self._bubble_after = self.root.after(
-                max(200, int(stay_ms) - 1000), self._begin_bubble_fade
-            )
+            self._bubble_anchor = (ax, ay)
+            self._bubble_kind = kind
+            self._bubble_hwnd = hwnd
+            self._bubble_dib = ((cw, ch), hbmp, mdc, bits)
+
+            win.bind("<Button-1>", lambda e: self._hide_balance_bubble())
+            self._push_bubble_alpha(0)
+            win.deiconify()
+            if kind == "balance":
+                win.lift()
+            else:
+                try:
+                    win.lower()
+                    win.lift(self.pet)
+                except Exception:
+                    pass
+            self._bubble_stay_ms = max(1200, int(stay_ms))
+            self._fade_mode = "in"
+            self._fade_start = time.monotonic()
+            self._fade_balance_bubble()
         except Exception:
-            log("余额气泡显示失败\n" + traceback.format_exc())
+            self._free_bubble_dib()
+            log("气泡显示失败\n" + traceback.format_exc())
 
     def _begin_bubble_fade(self) -> None:
+        self._fade_mode = "out"
         self._fade_start = time.monotonic()
         self._fade_balance_bubble()
 
     def _fade_balance_bubble(self) -> None:
-        """按真实时间以约 60fps 平滑淡出，总时长 1 秒。"""
+        """按真实时间约 60fps 柔和淡入 / 淡出。"""
         win = self.balance_bubble
         if win is None:
             return
         start = self._fade_start if self._fade_start is not None else time.monotonic()
-        t = min(1.0, max(0.0, (time.monotonic() - start) / 1.0))
-        smooth = t * t * (3.0 - 2.0 * t)  # smoothstep：首尾更柔和
-        try:
-            win.attributes("-alpha", max(0.0, 1.0 - smooth))
-        except Exception:
-            pass
+        elapsed = time.monotonic() - start
+        if self._fade_mode == "in":
+            t = min(1.0, max(0.0, elapsed / 0.18))
+            smooth = t * t * (3.0 - 2.0 * t)
+            self._push_bubble_alpha(int(255 * smooth))
+            if t < 1.0:
+                self._bubble_after = self.root.after(16, self._fade_balance_bubble)
+            else:
+                self._bubble_after = self.root.after(
+                    max(400, getattr(self, "_bubble_stay_ms", 3000) - 900),
+                    self._begin_bubble_fade,
+                )
+            return
+
+        t = min(1.0, max(0.0, elapsed / 0.90))
+        smooth = t * t * (3.0 - 2.0 * t)
+        self._push_bubble_alpha(int(255 * max(0.0, 1.0 - smooth)))
         if t < 1.0:
             self._bubble_after = self.root.after(16, self._fade_balance_bubble)
         else:
@@ -2014,8 +2486,9 @@ class App:
         try:
             if px is None or py is None:
                 px, py, _, _ = self._pet_rect()
-            bx = px + 14 - cw
-            by = py - ch - 2
+            ax, ay = self._bubble_anchor
+            bx = px + int(self.pet_size * 0.22) - ax
+            by = py + int(self.pet_size * 0.08) - ay
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
             bx = max(4, min(bx, sw - cw - 4))
             by = max(4, min(by, sh - ch - 4))
@@ -2031,6 +2504,8 @@ class App:
             except Exception:
                 pass
             self._bubble_after = None
+        self._free_bubble_dib()
+        self._bubble_hwnd = 0
         if self.balance_bubble is not None:
             try:
                 self.balance_bubble.destroy()
@@ -2324,12 +2799,18 @@ class App:
 
         # 检索文档中最相关的片段，让回答优先依据文档内容
         self._refresh_doc_if_needed()
-        doc_chunks = self._pick_doc_chunks(text)
+        doc_chunks, doc_names = self._pick_doc_chunks(text)
         user_content = ("用户的问题或选中的文字：\n" if web else "选中文本：\n") + cut + "\n\n"
         if doc_chunks:
-            doc_name = self.doc_path.name if self.doc_path else "参考文档"
+            if len(doc_names) <= 1:
+                doc_desc = f"参考文档《{doc_names[0] if doc_names else '参考文档'}》"
+            else:
+                listed = "、".join(f"《{n}》" for n in doc_names[:6])
+                if len(doc_names) > 6:
+                    listed += f" 等 {len(doc_names)} 份文档"
+                doc_desc = f"参考文档（{listed}）"
             user_content += (
-                f"参考文档《{doc_name}》中的相关片段（按原文顺序）：\n<<<\n"
+                f"{doc_desc}中的相关片段（按原文顺序）：\n<<<\n"
                 + "\n\n……\n\n".join(doc_chunks)
                 + "\n>>>\n\n"
                 "请优先依据上面的文档片段解释选中文本；如果文档片段没有覆盖相关内容，"
@@ -2464,9 +2945,9 @@ class App:
             while True:
                 kind, gen, data = self.msg_q.get_nowait()
                 if kind == "doc":
-                    self._on_doc_loaded(data)
+                    self._on_doc_loaded(data, gen)
                 elif kind == "doc_error":
-                    self._on_doc_error(data)
+                    self._on_doc_error(data, gen)
                 elif kind == "toggle":
                     self.toggle_listen()
                 elif kind == "selection" and gen == self.gen:
@@ -2553,12 +3034,20 @@ class App:
         a = (answer or "").strip()
         if not q or not a:
             return
+        with self.doc_lock:
+            doc_names = [d["name"] for d in self.docs]
+        if not doc_names:
+            doc_label = ""
+        elif len(doc_names) <= 3:
+            doc_label = "、".join(doc_names)
+        else:
+            doc_label = f"{doc_names[0]} 等 {len(doc_names)} 个文档"
         self.history.append(
             {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "q": q,
                 "a": a,
-                "doc": self.doc_path.name if self.doc_path else "",
+                "doc": doc_label,
             }
         )
         self.history = self.history[-HISTORY_MAX:]
@@ -3041,7 +3530,8 @@ class App:
 
         tip = (
             "选择上方服务商会自动填入接口地址与默认模型，也可以手动填写任意 OpenAI 兼容地址。\n"
-            "联网搜索仅 DeepSeek 官方接口支持，其他服务商会自动忽略。"
+            "联网搜索仅 DeepSeek 官方接口支持，其他服务商会自动忽略。\n"
+            "文档参考字数上限默认 100000；谨慎调高，会极大增加 token 消耗，日常建议 10000 以内。"
         )
         tk.Label(
             win, text=tip, fg=SUB, bg=BG, font=(FONT, 8), justify="left", wraplength=440
@@ -3111,6 +3601,9 @@ class App:
                 self.toggle_listen()
             self.status.config(text="已隐藏到托盘 · 点托盘图标恢复")
             self.root.withdraw()
+            if self.cfg.get("pet_enabled") and not self.pet_exited:
+                self._show_pet()
+            self._sync_pet_base()
         except Exception:
             log("隐藏到托盘失败\n" + traceback.format_exc())
             self.quit_app()
@@ -3156,6 +3649,10 @@ class App:
         try:
             if self.hotkeys:
                 self.hotkeys.stop()
+        except Exception:
+            pass
+        try:
+            self._hide_pet()
         except Exception:
             pass
         try:
