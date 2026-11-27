@@ -103,6 +103,7 @@ DEFAULT_CONFIG = {
     ),
     "max_chars": 2000,
     "doc_context_chars": DOC_BUDGET,
+    "web_search": False,
     "last_doc_path": "",
     "topmost": True,
     "window_pos": None,
@@ -1150,11 +1151,13 @@ class App:
         url = base + "/chat/completions"
         limit = int(cfg.get("max_chars") or 2000)
         cut = text if len(text) <= limit else text[:limit] + "…"
+        # 联网搜索：仅 DeepSeek 官方接口支持 deepseek_web_search 服务端工具
+        web = bool(cfg.get("web_search")) and "api.deepseek.com" in base
 
         # 检索文档中最相关的片段，让回答优先依据文档内容
         self._refresh_doc_if_needed()
         doc_chunks = self._pick_doc_chunks(text)
-        user_content = "选中文本：\n" + cut + "\n\n"
+        user_content = ("用户的问题或选中的文字：\n" if web else "选中文本：\n") + cut + "\n\n"
         if doc_chunks:
             doc_name = self.doc_path.name if self.doc_path else "参考文档"
             user_content += (
@@ -1164,19 +1167,44 @@ class App:
                 "请优先依据上面的文档片段解释选中文本；如果文档片段没有覆盖相关内容，"
                 "可以用通用知识补充，但要说明“文档中未涉及”。\n\n"
             )
-        user_content += "请解释这段内容。"
+        user_content += (
+            "请直接回答；若这段文字本身需要解释，就解释它。"
+            if web
+            else "请解释这段内容。"
+        )
+
+        system_prompt = cfg.get("system_prompt") or DEFAULT_CONFIG["system_prompt"]
+        if web:
+            now = datetime.now()
+            week = "星期" + "一二三四五六日"[now.weekday()]
+            system_prompt += (
+                f"\n\n已开启联网搜索。当前本机时间：{now:%Y-%m-%d %H:%M:%S}（{week}，北京时间）。"
+                "涉及时间或实时信息时，以此时间为准，搜索结果的发布时间只用于判断信息新旧；"
+                "如果用户是在提问，请直接回答，不要只解释问题本身。"
+            )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if web:
+            # DeepSeek 用户元信息标记：让模型知道今天的日期与所在地
+            messages.append(
+                {
+                    "role": "latest_reminder",
+                    "content": f"{now:%Y-%m-%d},{week},中国,Web,中文",
+                }
+            )
+        messages.append({"role": "user", "content": user_content})
+
         payload = {
             "model": cfg.get("model") or "deepseek-flash",
-            "messages": [
-                {"role": "system", "content": cfg.get("system_prompt") or DEFAULT_CONFIG["system_prompt"]},
-                {"role": "user", "content": user_content},
-            ],
+            "messages": messages,
             "stream": True,
             "temperature": 0.3,
         }
         # DeepSeek 新模型默认开启思考模式；划词解释求快，这里显式关闭
         if "api.deepseek.com" in base:
             payload["thinking"] = {"type": "disabled"}
+        if web:
+            payload["tools"] = [{"type": "deepseek_web_search"}]
         if doc_chunks:
             self.msg_q.put(
                 ("status", gen, f"识别 {len(text)} 字 · 引用文档 {len(doc_chunks)} 段")
@@ -1745,6 +1773,21 @@ class App:
         e_doc.pack(side="right", ipady=4)
         e_doc.insert(0, str(self.cfg.get("doc_context_chars", DOC_BUDGET)))
 
+        v_web = tk.BooleanVar(value=bool(self.cfg.get("web_search")))
+        tk.Checkbutton(
+            win,
+            text="联网搜索（实时信息，DeepSeek 官方接口，额外消耗 token）",
+            variable=v_web,
+            bg=BG,
+            fg=SUB,
+            activebackground=BG,
+            activeforeground=FG,
+            selectcolor=CARD,
+            font=(FONT, 9),
+            bd=0,
+            highlightthickness=0,
+        ).pack(anchor="w", padx=14, pady=(8, 0))
+
         tip = (
             "常用地址：\n"
             "DeepSeek  https://api.deepseek.com/v1  模型 deepseek-flash（V4.1）或 deepseek-v4-pro\n"
@@ -1787,6 +1830,7 @@ class App:
                 self.cfg["doc_context_chars"] = max(0, int(e_doc.get().strip()))
             except Exception:
                 self.cfg["doc_context_chars"] = DOC_BUDGET
+            self.cfg["web_search"] = bool(v_web.get())
             save_config(self.cfg)
             win.destroy()
             self.status.config(text="设置已保存 · 选词试试")
