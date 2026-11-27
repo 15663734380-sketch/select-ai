@@ -20,6 +20,7 @@
 
 import ctypes
 import json
+import math
 import queue
 import random
 import re
@@ -42,6 +43,11 @@ try:  # 桌宠动画引擎（只负责画面与动画，不含交互）
 except Exception:  # 引擎缺失时桌宠不显示，其余功能不受影响
     PetAnimator = None
     pet_layout = None
+
+try:  # 系统托盘（纯 ctypes 实现）
+    from tray_icon import TrayIcon
+except Exception:  # 托盘模块缺失时，关闭窗口仍按原来的方式退出
+    TrayIcon = None
 
 if getattr(sys, "frozen", False):
     # 打包成 exe 后：配置、历史、图标都放在 exe 同目录
@@ -68,25 +74,36 @@ def resource_path(name: str) -> Path:
             return q
     return p
 
-# 浅蓝配色（护眼）：取自应用图标的天蓝发梢与白色荷叶边
-# 层次：淡蓝窗口底 → 更浅的近白圆角卡片（文字框）→ 深海军蓝文字
-BG = "#dfeefb"           # 窗口底色：淡蓝
-CARD = "#fbfdff"        # 文字框 / 卡片：比底色更浅，接近纯白
-CARD_HOVER = "#eef6fe"
-HEADER_L = "#c9e3fb"     # 顶栏渐变起点（浅天蓝）
-HEADER_R = "#dfeefb"     # 顶栏渐变终点（与窗口底色衔接）
-HEADER_LINE = "#b9d8f5"  # 顶栏下沿的分隔线
-BORDER = "#b7d7f5"       # 淡蓝边框
-FG = "#1f3a63"
-TEXT_SOFT = "#33517c"
-SUB = "#5b7ba6"
-ACCENT = "#4189dd"
-ACCENT_HOVER = "#3277c8"
-OK = "#2ea77c"
-WARN = "#c97a12"
-SEL = "#cfe4fb"
-GOLD = "#a8731f"
-SKY = "#3a86d6"
+# 蓝色鲸鱼娘主题色系（柔和淡雅鲸蓝底 + 丝滑无断层渐变 + 深墨藏青高对比文字，久看护眼不累）
+# 层次：柔和宝石鲸蓝顶栏（珍珠月晕衬托角色）→ 逐像素超平滑过渡 → 淡晴空蓝底 → 珍珠白卡片 → 深墨蓝文字
+BG = "#d5e6fb"             # 窗口底色：柔和淡晴蓝（整体提淡，清新通透不压抑）
+GLASS = "#e7f1fe"          # 磨砂冰蓝玻璃条（文档栏底色）
+FOOT_BG = "#c7dcf9"        # 底部柔雾蓝锚定色（比正文微深半度，自然收尾）
+CARD = "#fcfdff"           # 文字框 / 卡片：珍珠白
+CARD_HOVER = "#dceafa"     # 次级按钮悬停：清透冰蓝
+CARD_SHADOW = "#b0c9ec"    # 卡片底部柔投影
+BORDER = "#9cbbe8"         # 卡片与按钮描边：柔海蓝
+BTN_BG = "#edf4fe"         # 正文次级按钮：淡冰蓝
+HEADER_L = "#5c7db8"       # 顶栏 / 标题栏主色：柔雅鲸蓝（比前版更淡润，且 Win11 按钮仍保持浅白图标）
+HEADER_R = "#5c7db8"       # 顶栏底色
+HEADER_LINE = "#a6c1ea"    # 过渡辅助色
+HEADER_FG = "#ffffff"      # 顶栏标题文字：纯白
+HEADER_SUB = "#e6effd"     # 顶栏未激活开关文字
+HEADER_BTN = "#6e8ec7"     # 顶栏次级按钮底色（柔雾蓝）
+HEADER_BTN_HOVER = "#7d9cd3"
+HEADER_BTN_EDGE = "#9bb6e6"
+FG = "#111b33"             # 正文主文字：深墨藏青（高对比度，阅读省力）
+TEXT_SOFT = "#1a2847"      # 提问框与次级文字：深靛墨色（清晰锐利）
+SUB = "#2b3d63"            # 辅助说明文字（设置项标签、提示语、时间戳）：深雾靛蓝（告别浅灰蓝费眼）
+ACCENT = "#5593e6"         # 主按钮：亮鲸尾蓝
+ACCENT_HOVER = "#4280d4"   # 主按钮悬停
+OK = "#168f6a"             # 监听状态灯：深海沫青绿（与深字协调）
+WARN = "#b86411"           # 警示色：深暖琥珀
+SEL = "#cfe2fc"            # 文本选中高亮：柔海蓝
+GOLD = "#98630d"           # 浅底标题强调金：深琥珀金（白底上高对比可读）
+GOLD_STAR = "#ffe28a"      # 顶栏星光点缀金
+SKY = "#1f59ad"            # 深海蓝（小节竖条 / 行内代码 / 历史问题标题）
+CODE_BG = "#ebf3fe"        # 行内代码底色
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
 
@@ -357,6 +374,7 @@ class App:
         self._fade_start = None
         self._pet_menu_obj = None
         self.pet_anim = None
+        self.tray = None
         self._egg_after = None
         self.ask_grip = None
 
@@ -385,8 +403,12 @@ class App:
             self.ui = max(1.0, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
         except Exception:
             pass
-        self.head_h = int(56 * self.ui)
-        self.brand_w = int(142 * self.ui)
+        self.head_h = int(48 * self.ui)
+        self.brand_w = int(166 * self.ui)
+        self._bg_brushes = ()
+        self._wndproc_ref = None
+        self._old_wndproc = None
+        self._subclassed_hwnd = 0
         # 顶栏里的角色形象（取自应用图标；缺少 Pillow 时自动省略）
         self.mascot = None
         try:
@@ -401,7 +423,7 @@ class App:
         self.root.minsize(380, 400)
         self.root.geometry(self._initial_geometry())
         self.root.attributes("-topmost", bool(self.cfg.get("topmost", True)))
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.root.bind("<Unmap>", self._on_minimize)
         self.root.bind("<Map>", self._on_restore)
         self.root.after(600, self._titlebar)
@@ -420,6 +442,8 @@ class App:
         y = max(20, min(y, sh - need_h - 60))
         self.root.geometry(f"{need_w}x{need_h}+{x}+{y}")
         self.root.update()  # 先把界面绘制完成，避免首帧空白小窗
+        self._titlebar()
+        self._install_bg_guard()
         self.std_h = 0
         self.root.deiconify()
         self.root.lift()
@@ -472,7 +496,7 @@ class App:
             hwnd = self._hwnd(win)
             if not hwnd:
                 return
-            u = ctypes.windll.user32
+            u = ctypes.WinDLL("user32")
             u.GetDpiForWindow.argtypes = [ctypes.c_void_p]
             u.GetDpiForWindow.restype = ctypes.c_uint
             dpi = int(u.GetDpiForWindow(ctypes.c_void_p(hwnd))) or 96
@@ -535,19 +559,95 @@ class App:
         except Exception:
             log("窗口位置校正失败\n" + traceback.format_exc())
 
+    @staticmethod
+    def _colorref(hex_color: str) -> int:
+        c = hex_color.lstrip("#")
+        r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        return (b << 16) | (g << 8) | r
+
     def _titlebar(self, win=None) -> None:
         try:
             hwnd = self._hwnd(win)
             if not hwnd:
                 return
-            value = ctypes.c_int(0)  # 0 = 浅色标题栏
+            dwm = ctypes.windll.dwmapi
+            # 保持 0（浅色模式），避免 Win11 任务栏恢复窗口时先闪黑底；搭配深色 CaptionColor 系统会自动给按钮配浅色图标
+            dark = ctypes.c_int(0)
             for attr in (20, 19):
-                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
+                if dwm.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(dark), ctypes.sizeof(dark)
                 ) == 0:
                     break
+            # Windows 11 原生标题栏染色：与顶栏宝石鲸蓝无缝一体
+            for attr, hex_col in (
+                (35, HEADER_L),     # DWMWA_CAPTION_COLOR
+                (36, HEADER_FG),    # DWMWA_TEXT_COLOR
+                (34, "#4d6ca3"),    # DWMWA_BORDER_COLOR
+            ):
+                val = ctypes.c_int(self._colorref(hex_col))
+                dwm.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)
+                )
         except Exception:
             pass
+
+    def _install_bg_guard(self) -> None:
+        """为主窗口设置浅蓝 Win32 背景画刷并拦截 WM_ERASEBKGND，避免从任务栏/托盘恢复时闪黑框。"""
+        try:
+            hwnd = self._hwnd(self.root)
+            if not hwnd or self._subclassed_hwnd == hwnd:
+                return
+            u = ctypes.WinDLL("user32")
+            g = ctypes.WinDLL("gdi32")
+            g.CreateSolidBrush.argtypes = [wintypes.DWORD]
+            g.CreateSolidBrush.restype = ctypes.c_void_p
+            g.DeleteObject.argtypes = [ctypes.c_void_p]
+            u.FillRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_void_p]
+            u.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            u.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            u.SetClassLongPtrW.restype = ctypes.c_void_p
+
+            head_br = g.CreateSolidBrush(self._colorref(HEADER_L))
+            bg_br = g.CreateSolidBrush(self._colorref(BG))
+            self._bg_brushes = (head_br, bg_br)
+            # 为 TkTopLevel 类设置默认浅蓝底刷（取代原本的 NULL 空白刷）
+            u.SetClassLongPtrW(hwnd, -10, bg_br)
+
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(
+                LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            )
+            u.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            ]
+            u.CallWindowProcW.restype = LRESULT
+            u.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            u.SetWindowLongPtrW.restype = ctypes.c_void_p
+
+            old_ref = {"ptr": None}
+
+            def wndproc(h, msg, wp, lp):
+                if msg == 0x0014 and wp:  # WM_ERASEBKGND
+                    rc = wintypes.RECT()
+                    if u.GetClientRect(h, ctypes.byref(rc)):
+                        split = min(rc.bottom, self.head_h)
+                        r_top = wintypes.RECT(rc.left, rc.top, rc.right, split)
+                        r_bot = wintypes.RECT(rc.left, split, rc.right, rc.bottom)
+                        u.FillRect(wp, ctypes.byref(r_top), head_br)
+                        u.FillRect(wp, ctypes.byref(r_bot), bg_br)
+                        return 1
+                if msg == 0x0082 and old_ref["ptr"]:  # WM_NCDESTROY
+                    u.SetWindowLongPtrW(h, -4, old_ref["ptr"])
+                return u.CallWindowProcW(old_ref["ptr"], h, msg, wp, lp)
+
+            cb = WNDPROC(wndproc)
+            old_ptr = u.SetWindowLongPtrW(hwnd, -4, ctypes.cast(cb, ctypes.c_void_p))
+            old_ref["ptr"] = old_ptr
+            self._wndproc_ref = cb
+            self._old_wndproc = old_ptr
+            self._subclassed_hwnd = hwnd
+        except Exception:
+            log("背景防闪烁挂载失败\n" + traceback.format_exc())
 
     @staticmethod
     def _gradient(cv, w: int, h: int, c0: str, c1: str) -> None:
@@ -561,77 +661,249 @@ class App:
             )
             cv.create_line(x, 0, x, h, fill=color)
 
-    def _mkbtn(self, parent, text, cmd, primary=False, font_size=9):
-        """主按钮：蓝底白字；次级按钮：白底深蓝字 + 淡蓝边。"""
+    @staticmethod
+    def _draw_round_rect(cv, x1: int, y1: int, x2: int, y2: int, r: int,
+                         fill: str, outline: str = "", tags: str = "rr") -> None:
+        """在 Canvas 上绘制锯齿平滑的圆角矩形（弧角 + 矩形 + 细边线）。"""
+        r = max(1, min(r, (x2 - x1) // 2, (y2 - y1) // 2))
+        boxes = (
+            (x1, y1, x1 + 2 * r, y1 + 2 * r),
+            (x2 - 2 * r, y1, x2, y1 + 2 * r),
+            (x2 - 2 * r, y2 - 2 * r, x2, y2),
+            (x1, y2 - 2 * r, x1 + 2 * r, y2),
+        )
+        starts = (90, 0, 270, 180)
+        for box, start in zip(boxes, starts):
+            cv.create_arc(*box, start=start, extent=90, style="pieslice",
+                          fill=fill, outline="", tags=tags)
+            if outline:
+                cv.create_arc(*box, start=start, extent=90, style="arc",
+                              outline=outline, tags=tags)
+        cv.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline="", tags=tags)
+        cv.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline="", tags=tags)
+        if outline:
+            cv.create_line(x1 + r, y1, x2 - r, y1, fill=outline, tags=tags)
+            cv.create_line(x1 + r, y2, x2 - r, y2, fill=outline, tags=tags)
+            cv.create_line(x1, y1 + r, x1, y2 - r, fill=outline, tags=tags)
+            cv.create_line(x2, y1 + r, x2, y2 - r, fill=outline, tags=tags)
+
+    def _mkbtn(self, parent, text, cmd, primary=False, font_size=9, in_header=False, fixed_width=None):
+        """圆角胶囊按钮：主按钮用鲸尾天蓝；顶栏次级用深靛磨砂；正文次级用海盐冰蓝描边。"""
+        import tkinter.font as tkfont
+
         if primary:
             bg, abg, edge, fg = ACCENT, ACCENT_HOVER, ACCENT, "#ffffff"
+        elif in_header:
+            bg, abg, edge, fg = HEADER_BTN, HEADER_BTN_HOVER, HEADER_BTN_EDGE, HEADER_FG
         else:
-            bg, abg, edge, fg = CARD, CARD_HOVER, BORDER, TEXT_SOFT
-        return tk.Button(
-            parent,
-            text=text,
-            command=cmd,
-            bg=bg,
-            fg=fg,
-            disabledforeground=SUB,
-            activebackground=abg,
-            activeforeground=fg,
-            bd=0,
-            relief="flat",
-            font=(FONT, font_size, "bold" if primary else "normal"),
-            padx=12 if primary else 10,
-            pady=4,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground=edge,
-            highlightcolor=SKY,
-        )
+            bg, abg, edge, fg = BTN_BG, CARD_HOVER, BORDER, TEXT_SOFT
 
-    def _section_label(self, parent, text: str) -> None:
+        try:
+            parent_bg = parent.cget("bg")
+        except Exception:
+            parent_bg = BG
+
+        weight = "bold" if primary else "normal"
+        fnt = tkfont.Font(family=FONT, size=font_size, weight=weight)
+        padx = int((13 if primary else 11) * self.ui)
+        pady = int(5 * self.ui)
+        rad = int(8 * self.ui)
+
+        cv = tk.Canvas(parent, bg=parent_bg, bd=0, highlightthickness=0, cursor="hand2")
+        st = {
+            "text": text,
+            "cmd": cmd,
+            "bg": bg,
+            "abg": abg,
+            "edge": edge,
+            "fg": fg,
+            "state": "normal",
+            "hover": False,
+            "down": False,
+            "size": None,
+            "fixed_w": fixed_width,
+        }
+
+        def measure():
+            tw = fnt.measure(st["text"])
+            if st["fixed_w"]:
+                w = max(st["fixed_w"], tw + int(12 * self.ui))
+            else:
+                w = tw + 2 * padx
+            h = fnt.metrics("linespace") + 2 * pady
+            cv.configure(width=w, height=h)
+            return w, h
+
+        def redraw(_event=None, force=True):
+            w = cv.winfo_width()
+            h = cv.winfo_height()
+            if w < 4 or h < 4:
+                w, h = int(cv.cget("width")), int(cv.cget("height"))
+            if not force and st["size"] == (w, h):
+                return
+            st["size"] = (w, h)
+            cv.delete("btn")
+            disabled = st["state"] == "disabled"
+            fill = st["abg"] if (not disabled and (st["hover"] or st["down"])) else st["bg"]
+            fg_col = SUB if disabled else st["fg"]
+            edge_col = BORDER if disabled else st["edge"]
+            self._draw_round_rect(cv, 0, 0, w - 1, h - 1, rad, fill=fill, outline=edge_col, tags="btn")
+            dy = 1 if (st["down"] and not disabled) else 0
+            cv.create_text(w // 2, h // 2 + dy, text=st["text"], fill=fg_col, font=fnt, tags="btn")
+
+        def on_enter(_e):
+            if st["state"] != "disabled":
+                st["hover"] = True
+                redraw()
+
+        def on_leave(_e):
+            st["hover"] = False
+            st["down"] = False
+            redraw()
+
+        def on_press(_e):
+            if st["state"] != "disabled":
+                st["down"] = True
+                redraw()
+
+        def on_release(e):
+            was_down = st["down"]
+            st["down"] = False
+            redraw()
+            if was_down and st["state"] != "disabled" and st["cmd"]:
+                if 0 <= e.x <= cv.winfo_width() and 0 <= e.y <= cv.winfo_height():
+                    st["cmd"]()
+
+        def config_btn(**kw):
+            need_size = False
+            if "text" in kw:
+                st["text"] = kw.pop("text")
+                need_size = True
+            if "command" in kw:
+                st["cmd"] = kw.pop("command")
+            if "state" in kw:
+                st["state"] = kw.pop("state")
+                cv.configure(cursor="" if st["state"] == "disabled" else "hand2")
+            for k, sk in (
+                ("bg", "bg"),
+                ("activebackground", "abg"),
+                ("fg", "fg"),
+                ("highlightbackground", "edge"),
+            ):
+                if k in kw:
+                    st[sk] = kw.pop(k)
+            kw.pop("activeforeground", None)
+            if kw:
+                tk.Canvas.configure(cv, **kw)
+            if need_size:
+                measure()
+            redraw()
+
+        cv.config = config_btn
+        cv.configure = config_btn
+        measure()
+        redraw()
+        cv.bind("<Configure>", lambda _e: redraw(force=False))
+        cv.bind("<Enter>", on_enter)
+        cv.bind("<Leave>", on_leave)
+        cv.bind("<ButtonPress-1>", on_press)
+        cv.bind("<ButtonRelease-1>", on_release)
+        return cv
+
+    def _mkpill_toggle(self, parent, text: str, var: tk.BooleanVar, cmd):
+        """顶栏专用胶囊开关（用于「置顶」等状态切换）。"""
+        import tkinter.font as tkfont
+
+        fnt = tkfont.Font(family=FONT, size=9)
+        padx = int(10 * self.ui)
+        pady = int(4 * self.ui)
+        rad = int(8 * self.ui)
+        try:
+            parent_bg = parent.cget("bg")
+        except Exception:
+            parent_bg = HEADER_R
+
+        cv = tk.Canvas(parent, bg=parent_bg, bd=0, highlightthickness=0, cursor="hand2")
+        st = {"hover": False, "size": None}
+
+        def measure():
+            w = fnt.measure("✓ " + text) + 2 * padx
+            h = fnt.metrics("linespace") + 2 * pady
+            cv.configure(width=w, height=h)
+            return w, h
+
+        def redraw(_event=None, force=True):
+            w = cv.winfo_width()
+            h = cv.winfo_height()
+            if w < 4 or h < 4:
+                w, h = int(cv.cget("width")), int(cv.cget("height"))
+            if not force and st["size"] == (w, h):
+                return
+            st["size"] = (w, h)
+            cv.delete("pill")
+            on = bool(var.get())
+            if on:
+                fill = "#799ad4" if st["hover"] else HEADER_BTN
+                edge = GOLD_STAR if st["hover"] else "#b3d1fc"
+                fg_col = HEADER_FG
+                label = "✓ " + text
+            else:
+                fill = "#6a8bc4" if st["hover"] else HEADER_R
+                edge = "#9bb8e8" if st["hover"] else "#809fd4"
+                fg_col = HEADER_SUB
+                label = text
+            self._draw_round_rect(cv, 0, 0, w - 1, h - 1, rad, fill=fill, outline=edge, tags="pill")
+            cv.create_text(w // 2, h // 2, text=label, fill=fg_col, font=fnt, tags="pill")
+
+        def on_click(_e):
+            var.set(not bool(var.get()))
+            redraw()
+            if cmd:
+                cmd()
+
+        measure()
+        redraw()
+        cv.bind("<Configure>", lambda _e: redraw(force=False))
+        cv.bind("<Enter>", lambda _e: (st.__setitem__("hover", True), redraw()))
+        cv.bind("<Leave>", lambda _e: (st.__setitem__("hover", False), redraw()))
+        cv.bind("<ButtonRelease-1>", on_click)
+        return cv
+
+    def _section_label(self, parent, text: str, bar_color: str = SKY) -> None:
         """带竖条的小节标题。"""
-        bar = tk.Frame(parent, bg=SKY, width=3, height=12)
+        bar = tk.Frame(parent, bg=bar_color, width=3, height=13)
         bar.pack(side="left", padx=(2, 7), pady=1)
-        tk.Label(parent, text=text, fg=SUB, bg=BG, font=(FONT, 9)).pack(side="left")
+        tk.Label(parent, text=text, fg=TEXT_SOFT, bg=BG, font=(FONT, 9, "bold")).pack(side="left")
 
-    def _card(self, parent, bg, pad=4, radius=10, **pack_kw):
-        """圆角卡片：在画布上画圆角白底，里面放一个 Frame，文字框放在 Frame 里。
+    def _card(self, parent, bg, pad=4, radius=11, fill_color=None, **pack_kw):
+        """圆角卡片：带底部微投影与焦点高亮边框。
 
         返回 (内部 Frame, 设置边框颜色的函数)。bg 需与父容器底色一致，画布本身才看不出边界。
         """
+        fc = fill_color or CARD
         cv = tk.Canvas(parent, bg=bg, bd=0, highlightthickness=0)
         cv.pack(**pack_kw)
-        inner = tk.Frame(cv, bg=CARD)
+        inner = tk.Frame(cv, bg=fc)
         win = cv.create_window(0, 0, window=inner, anchor="nw")
-        st = {"outline": BORDER, "req": None}
+        st = {"outline": BORDER, "req": None, "size": None}
 
-        def draw(_event=None):
+        def draw(_event=None, force=False):
             w, h = cv.winfo_width(), cv.winfo_height()
-            if w < 4 or h < 4:
+            if w < 6 or h < 6:
                 return
-            r = max(1, min(radius, w // 2, h // 2))
-            x2, y2 = w - 1, h - 1
+            if not force and st["size"] == (w, h):
+                return
+            st["size"] = (w, h)
+            x2, y2 = w - 1, h - 3  # 底部预留 2px 给柔和立体投影
             cv.delete("card")
-            o = st["outline"]
-            boxes = ((0, 0, 2 * r, 2 * r), (x2 - 2 * r, 0, x2, 2 * r),
-                     (x2 - 2 * r, y2 - 2 * r, x2, y2), (0, y2 - 2 * r, 2 * r, y2))
-            starts = (90, 0, 270, 180)
-            for box, start in zip(boxes, starts):
-                cv.create_arc(*box, start=start, extent=90, style="pieslice",
-                              fill=CARD, outline="", tags="card")
-                cv.create_arc(*box, start=start, extent=90, style="arc",
-                              outline=o, tags="card")
-            cv.create_rectangle(r, 0, x2 - r, y2, fill=CARD, outline="", tags="card")
-            cv.create_rectangle(0, r, x2, y2 - r, fill=CARD, outline="", tags="card")
-            cv.create_line(r, 0, x2 - r, 0, fill=o, tags="card")
-            cv.create_line(r, y2, x2 - r, y2, fill=o, tags="card")
-            cv.create_line(0, r, 0, y2 - r, fill=o, tags="card")
-            cv.create_line(x2, r, x2, y2 - r, fill=o, tags="card")
+            self._draw_round_rect(cv, 0, 2, x2, y2 + 2, radius, fill=CARD_SHADOW, outline="", tags="card")
+            self._draw_round_rect(cv, 0, 0, x2, y2, radius, fill=fc, outline=st["outline"], tags="card")
             cv.coords(win, pad, pad)
-            cv.itemconfigure(win, width=w - 2 * pad, height=h - 2 * pad)
+            cv.itemconfigure(win, width=w - 2 * pad, height=h - 2 * pad - 2)
 
         def fit(_event=None):
             # 画布不会自动跟随内部控件，这里按内部需求尺寸同步画布的请求尺寸
-            size = (inner.winfo_reqwidth() + 2 * pad, inner.winfo_reqheight() + 2 * pad)
+            size = (inner.winfo_reqwidth() + 2 * pad, inner.winfo_reqheight() + 2 * pad + 2)
             if size != st["req"]:
                 st["req"] = size
                 cv.configure(width=size[0], height=size[1])
@@ -639,10 +911,65 @@ class App:
         cv.bind("<Configure>", draw)
         inner.bind("<Configure>", fit)
         fit()
-        return inner, lambda color: (st.__setitem__("outline", color), draw())
+        return inner, lambda color: (st.__setitem__("outline", color), draw(force=True))
+
+    @staticmethod
+    def _vfade(cv, c0: str, c1: str, wave: bool = False) -> None:
+        """逐像素 smootherstep 连续渐变（无分块色阶断层，可选融入极轻柔连续水波微澜）。"""
+        def mix(a, b, t):
+            return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+        state = {"size": None, "img": None}
+
+        def draw(_event=None):
+            w = cv.winfo_width()
+            h = cv.winfo_height()
+            if w < 2 or h < 2 or state["size"] == (w, h):
+                return
+            state["size"] = (w, h)
+            cv.delete("fade")
+            a = tuple(int(c0[i : i + 2], 16) for i in (1, 3, 5))
+            b = tuple(int(c1[i : i + 2], 16) for i in (1, 3, 5))
+            try:
+                from PIL import Image, ImageTk
+
+                buf = bytearray(w * h * 3)
+                den = max(1, h - 1)
+                idx = 0
+                if wave and h >= 12:
+                    ang_x = [math.sin(x * 2.0 * math.pi / max(1, w) + 0.4) * 0.065 for x in range(w)]
+                else:
+                    ang_x = None
+                for y in range(h):
+                    yn = y / den
+                    env = math.sin(math.pi * yn) if ang_x is not None else 0.0
+                    for x in range(w):
+                        u = yn + (env * ang_x[x] if ang_x is not None else 0.0)
+                        if u <= 0.0:
+                            t = 0.0
+                        elif u >= 1.0:
+                            t = 1.0
+                        else:
+                            # 五次 smootherstep：起止点斜率与曲率均为 0，完全消除折角感
+                            t = u * u * u * (u * (6.0 * u - 15.0) + 10.0)
+                        buf[idx] = int(a[0] + (b[0] - a[0]) * t + 0.5)
+                        buf[idx + 1] = int(a[1] + (b[1] - a[1]) * t + 0.5)
+                        buf[idx + 2] = int(a[2] + (b[2] - a[2]) * t + 0.5)
+                        idx += 3
+                im = Image.frombytes("RGB", (w, h), bytes(buf))
+                photo = ImageTk.PhotoImage(im)
+                state["img"] = photo  # 保持引用避免被 GC 回收
+                cv.create_image(0, 0, image=photo, anchor="nw", tags="fade")
+            except Exception:
+                for y in range(h):
+                    u = y / max(1, h - 1)
+                    t = u * u * u * (u * (6.0 * u - 15.0) + 10.0)
+                    cv.create_line(0, y, w, y, fill=mix(a, b, t), tags="fade")
+
+        cv.bind("<Configure>", draw)
 
     def _build_ui(self) -> None:
-        # 顶栏：整条是浅天蓝渐变，左侧带角色形象和标题，右侧是操作按钮
+        # 顶栏：鲸娘宝石蓝底色（与 Win11 标题栏无缝一体），角色后方叠加无边框珍珠月晕提升辨识度，下方以柔浪渐入雾蓝底色
         header = tk.Frame(self.root, bg=HEADER_R, height=self.head_h)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -652,64 +979,91 @@ class App:
             bg=HEADER_L, bd=0, highlightthickness=0,
         )
         brand.pack(side="left")
-        self._gradient(brand, self.brand_w, self.head_h, HEADER_L, HEADER_R)
         tx = int(10 * self.ui)
         if self.mascot is not None:
-            brand.create_image(
-                tx + self.mascot.width() // 2, self.head_h // 2,
-                image=self.mascot, anchor="center",
-            )
-            tx += self.mascot.width() + int(8 * self.ui)
-        brand.create_text(
-            tx, self.head_h // 2, text="划词问答", fill=FG,
+            mx = tx + self.mascot.width() // 2
+            my = self.head_h // 2
+            # 18 层羽化珍珠柔光晕：无硬圆边框，既不遮挡发梢尾鳍，又让蓝衣蓝发在亮柔光前清晰跳脱
+            r_in = self.mascot.width() * 0.25
+            r_out = self.mascot.width() * 0.62
+            c_out = tuple(int(HEADER_L[i : i + 2], 16) for i in (1, 3, 5))
+            c_in = (252, 254, 255)
+            steps = 18
+            for i in range(steps):
+                t = i / (steps - 1)
+                e = t ** 1.35
+                rad = r_out - (r_out - r_in) * t
+                col = "#%02x%02x%02x" % tuple(
+                    int(c_out[k] + (c_in[k] - c_out[k]) * e) for k in range(3)
+                )
+                brand.create_oval(
+                    mx - rad, my - rad, mx + rad, my + rad,
+                    fill=col, outline="",
+                )
+            brand.create_image(mx, my, image=self.mascot, anchor="center")
+            tx += self.mascot.width() + int(9 * self.ui)
+        tid = brand.create_text(
+            tx, self.head_h // 2, text="划词问答", fill=HEADER_FG,
             font=(FONT, 11, "bold"), anchor="w",
         )
+        bbox = brand.bbox(tid)
+        if bbox:
+            sx = bbox[2] + int(4 * self.ui)
+            sy = self.head_h // 2 - int(1 * self.ui)
+            brand.create_text(
+                sx, sy, text="✦", fill=GOLD_STAR, font=(FONT, 9), anchor="w",
+            )
+            brand.create_text(
+                sx + int(9 * self.ui), sy - int(5 * self.ui),
+                text="✧", fill="#d7e6ff", font=(FONT, 7), anchor="w",
+            )
 
         acts = tk.Frame(header, bg=HEADER_R)
         acts.pack(side="right", fill="x", expand=True)
-        pady = max(8, (self.head_h - 32) // 2)
-        self.btn_set = self._mkbtn(acts, "设置", self.open_settings)
-        self.btn_set.pack(side="right", padx=(6, 12), pady=pady)
+        self.btn_set = self._mkbtn(acts, "设置", self.open_settings, in_header=True)
+        self.btn_set.pack(side="right", padx=(6, 12))
 
         self.btn_listen = self._mkbtn(
             acts, "开始检测", self.toggle_listen, primary=True
         )
-        self.btn_listen.pack(side="right", padx=2, pady=pady)
+        self.btn_listen.pack(side="right", padx=2)
 
         self.var_top = tk.BooleanVar(value=bool(self.cfg.get("topmost", True)))
-        chk = tk.Checkbutton(
-            acts,
-            text="置顶",
-            variable=self.var_top,
-            command=self._on_topmost,
-            bg=HEADER_R,
-            fg=TEXT_SOFT,
-            selectcolor="white",
-            activebackground=HEADER_R,
-            activeforeground=FG,
-            font=(FONT, 9),
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        chk.pack(side="right", padx=(0, 8), pady=pady)
-        tk.Frame(self.root, bg=HEADER_LINE, height=1).pack(fill="x")
+        chk = self._mkpill_toggle(acts, "置顶", self.var_top, self._on_topmost)
+        chk.pack(side="right", padx=(0, 6))
 
-        # 文档栏：和正文同底色，不再单独占一条色带
-        docrow = tk.Frame(self.root, bg=BG)
-        docrow.pack(fill="x", padx=14, pady=(8, 0))
-        self.btn_doc_clear = self._mkbtn(docrow, "移除", self.remove_doc, font_size=8)
-        self.btn_doc = self._mkbtn(docrow, "加载文档", self.choose_doc, font_size=8)
-        self.btn_doc.pack(side="right")
+        fade_bar = tk.Canvas(
+            self.root, height=max(42, int(44 * self.ui)),
+            bg=HEADER_R, bd=0, highlightthickness=0,
+        )
+        fade_bar.pack(fill="x")
+        self._vfade(fade_bar, HEADER_R, BG, wave=True)
+
+        # 正文小按钮（移除 / 换文档 / 历史 / 复制 / 清空）采用与「历史」统一的固定宽高，不被文字长度或文档描述挤压
+        self._small_btn_w = int(45 * self.ui)
+
+        # 文档栏：磨砂冰蓝圆角玻璃条，承接海浪渐变并框住文档状态与按钮
+        doc_wrap = tk.Frame(self.root, bg=BG)
+        doc_wrap.pack(fill="x", padx=12, pady=(2, 2))
+        docrow, _ = self._card(doc_wrap, BG, pad=6, radius=10, fill_color=GLASS, fill="x")
+        self.btn_doc_clear = self._mkbtn(
+            docrow, "移除", self.remove_doc, font_size=8, fixed_width=self._small_btn_w
+        )
+        self.btn_doc = self._mkbtn(
+            docrow, "加载文档", self.choose_doc, font_size=8, fixed_width=self._small_btn_w
+        )
+        self.btn_doc.pack(side="right", padx=(4, 2))
+        tk.Label(docrow, text="◈", fg=SKY, bg=GLASS, font=(FONT, 9)).pack(side="left", padx=(4, 6))
         self.lbl_doc = tk.Label(
             docrow,
             text="未加载文档 · 回答基于通用知识",
-            fg=SUB,
-            bg=BG,
+            width=1,
+            fg=TEXT_SOFT,
+            bg=GLASS,
             font=(FONT, 9),
             anchor="w",
         )
-        self.lbl_doc.pack(side="left", fill="x", expand=True, padx=(2, 8))
+        self.lbl_doc.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         body = tk.Frame(self.root, bg=BG)
         self.body = body
@@ -770,11 +1124,13 @@ class App:
         self.txt_sel.bind("<FocusIn>", lambda e: sel_outline(ACCENT))
         self.txt_sel.bind("<FocusOut>", lambda e: sel_outline(BORDER))
 
-        # ---- AI 解答：白色圆角卡片，滚动条收在卡片内
+        # ---- AI 解答：珍珠白圆角卡片，滚动条收在卡片内
         top_row = tk.Frame(body, bg=BG)
         top_row.pack(fill="x")
-        self._section_label(top_row, "AI 解答")
-        btn_hist = self._mkbtn(top_row, "历史", self.open_history, font_size=8)
+        self._section_label(top_row, "AI 解答", bar_color=GOLD)
+        btn_hist = self._mkbtn(
+            top_row, "历史", self.open_history, font_size=8, fixed_width=self._small_btn_w
+        )
         btn_hist.pack(side="right", padx=(0, 0))
         self.lbl_meta = tk.Label(
             top_row, text="", fg=SUB, bg=BG, font=(FONT, 8)
@@ -809,24 +1165,35 @@ class App:
         self.txt_ans.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
         self._setup_tags()
 
-        footer = tk.Frame(self.root, bg=BG)
+        footer = tk.Frame(self.root, bg=FOOT_BG)
         self.footer = footer
         # 先于正文参与布局并贴底；窗口高度不足时由 _on_root_configure 优先折叠隐藏
-        footer.pack(side="bottom", fill="x", padx=14, pady=(6, 10), before=body)
+        footer.pack(side="bottom", fill="x", before=body)
 
-        btn_clear = self._mkbtn(footer, "清空", self.clear_answer, font_size=8)
+        ffade = tk.Canvas(footer, height=max(10, int(10 * self.ui)), bg=BG, bd=0, highlightthickness=0)
+        ffade.pack(fill="x")
+        self._vfade(ffade, BG, FOOT_BG)
+
+        fbar = tk.Frame(footer, bg=FOOT_BG)
+        fbar.pack(fill="x", padx=14, pady=(4, 10))
+
+        btn_clear = self._mkbtn(
+            fbar, "清空", self.clear_answer, font_size=8, fixed_width=self._small_btn_w
+        )
         btn_clear.pack(side="right")
-        btn_copy = self._mkbtn(footer, "复制", self.copy_answer, font_size=8)
+        btn_copy = self._mkbtn(
+            fbar, "复制", self.copy_answer, font_size=8, fixed_width=self._small_btn_w
+        )
         btn_copy.pack(side="right", padx=(0, 6))
 
-        # 状态灯：监听中亮绿色，暂停时为灰蓝
-        self.dot = tk.Label(footer, text="●", fg=SUB, bg=BG, font=(FONT, 8))
+        # 状态灯：监听中亮绿色，暂停时为晴空深雾蓝
+        self.dot = tk.Label(fbar, text="●", fg=SUB, bg=FOOT_BG, font=(FONT, 8))
         self.dot.pack(side="left", padx=(2, 6))
         self.status = tk.Label(
-            footer,
+            fbar,
             text="已暂停 · 点「开始检测」生效",
-            fg=SUB,
-            bg=BG,
+            fg=TEXT_SOFT,
+            bg=FOOT_BG,
             font=(FONT, 8),
             anchor="w",
         )
@@ -837,17 +1204,35 @@ class App:
             style.theme_use("clam")
         except Exception:
             pass
+        try:
+            style.layout(
+                "Ocean.Vertical.TScrollbar",
+                [
+                    (
+                        "Vertical.Scrollbar.trough",
+                        {
+                            "sticky": "ns",
+                            "children": [
+                                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+                            ],
+                        },
+                    )
+                ],
+            )
+        except Exception:
+            pass
         style.configure(
             "Ocean.Vertical.TScrollbar",
-            background="#c9e0f7",
+            background="#adc8ec",
             troughcolor=CARD,
             bordercolor=CARD,
-            arrowcolor="#6b93c4",
-            darkcolor="#c9e0f7",
-            lightcolor="#c9e0f7",
-            arrowsize=12,
+            arrowcolor="#4a72ad",
+            darkcolor="#adc8ec",
+            lightcolor="#adc8ec",
+            gripcount=0,
+            width=max(5, int(6 * self.ui)),
         )
-        style.map("Ocean.Vertical.TScrollbar", background=[("active", "#b5d5f3")])
+        style.map("Ocean.Vertical.TScrollbar", background=[("active", "#7aa5df")])
 
         # 记录提问卡片的默认高度：拖动窗口上边缘时由它吸收高度变化
         self.root.update_idletasks()
@@ -879,7 +1264,7 @@ class App:
             elif self.footer_hidden and h >= FOOTER_SHOW_H:
                 self.footer_hidden = False
                 self.footer.pack(
-                    side="bottom", fill="x", padx=14, pady=(6, 10), before=self.body
+                    side="bottom", fill="x", before=self.body
                 )
         except Exception:
             log("底部操作栏折叠失败\n" + traceback.format_exc())
@@ -953,7 +1338,7 @@ class App:
     def _setup_tags(self) -> None:
         self.txt_ans.tag_configure("h", font=(FONT, 11, "bold"), foreground=GOLD, spacing1=6, spacing3=4)
         self.txt_ans.tag_configure("b", font=(FONT, 10, "bold"), foreground=FG)
-        self.txt_ans.tag_configure("code", font=(MONO, 9), background="#eaf3fd", foreground=SKY)
+        self.txt_ans.tag_configure("code", font=(MONO, 9), background=CODE_BG, foreground=SKY)
         self.txt_ans.tag_configure("quote", foreground=SUB, lmargin1=10, lmargin2=10)
         self.txt_ans.tag_configure("li", lmargin1=14, lmargin2=24)
         self.txt_ans.configure(state="disabled")
@@ -1044,7 +1429,7 @@ class App:
         save_config(self.cfg)
         self.btn_doc.config(state="normal", text="换文档")
         if not self.btn_doc_clear.winfo_manager():
-            self.btn_doc_clear.pack(side="right", padx=(0, 6))
+            self.btn_doc_clear.pack(side="right", padx=(0, 4), before=self.lbl_doc)
         self._update_doc_label()
         if not info.get("quiet"):
             self.status.config(
@@ -1085,8 +1470,8 @@ class App:
             self.lbl_doc.config(text="未加载文档 · 回答基于通用知识", fg=SUB)
             return
         name = path.name
-        if len(name) > 16:
-            name = name[:15] + "…"
+        if len(name) > 10:
+            name = name[:9] + "…"
         self.lbl_doc.config(text=f"{name} · {total:,} 字 · {count} 段", fg=TEXT_SOFT)
 
     def _refresh_doc_if_needed(self) -> None:
@@ -1137,8 +1522,8 @@ class App:
         if self.listening:
             self.dot.config(fg=OK)
             self.btn_listen.config(text="暂停", bg=CARD, activebackground=CARD_HOVER,
-                                  fg=TEXT_SOFT, activeforeground=TEXT_SOFT,
-                                  highlightbackground=BORDER)
+                                  fg=FG, activeforeground=FG,
+                                  highlightbackground="#a3c5f5")
             self.status.config(text="监听中 · Ctrl+Alt+Q 暂停")
             self.root.attributes("-topmost", self.var_top.get())
         else:
@@ -1647,20 +2032,27 @@ class App:
         self.pet_drag = None
 
     def _restore_from_pet(self) -> None:
-        """点击桌宠：立刻恢复主窗口，桌宠保持常驻。"""
+        """点击桌宠或托盘恢复：先完成绘制再显示，避免首帧闪黑。"""
         try:
+            if self.root.state() == "withdrawn":
+                self.root.update_idletasks()
             self.root.deiconify()
+            self.root.update()
             self.root.lift()
             self.root.focus_force()
         except Exception:
             log("恢复主窗口失败\n" + traceback.format_exc())
 
     def _on_restore(self, event=None) -> None:
-        """主窗口从最小化恢复：桌宠重新出现（若已启用）。"""
+        """主窗口从最小化恢复：立刻同步刷新界面，桌宠按设置保持显示。"""
         if event is not None and event.widget is not self.root:
             return
         if self.root.state() == "iconic":
             return
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
         self.pet_exited = False
         if self.cfg.get("pet_enabled"):
             self.root.after(200, self._show_pet)
@@ -2023,6 +2415,11 @@ class App:
                     self.lbl_meta.config(text=data)
                 elif kind == "balance":
                     self._finish_balance(data)
+                elif kind == "tray":
+                    if data == "show":
+                        self._restore_from_pet()
+                    elif data == "quit":
+                        self.quit_app()
         except queue.Empty:
             pass
         except Exception:
@@ -2123,20 +2520,22 @@ class App:
 
         win.protocol("WM_DELETE_WINDOW", on_close)
 
-        # 顶栏：与主窗口、设置窗口同款浅天蓝 + 金色竖条
+        # 顶栏：与主窗口、设置窗口同款珍珠雾蓝 + 香槟金竖条，下方柔化过渡
         head = tk.Frame(win, bg=HEADER_L, height=44)
         head.pack(fill="x")
         head.pack_propagate(False)
-        tk.Frame(head, bg=GOLD, width=3, height=14).pack(side="left", padx=(16, 8))
+        tk.Frame(head, bg=GOLD_STAR, width=3, height=14).pack(side="left", padx=(16, 8))
         tk.Label(
-            head, text="历史问答", fg=FG, bg=HEADER_L, font=(FONT, 11, "bold")
+            head, text="历史问答", fg=HEADER_FG, bg=HEADER_L, font=(FONT, 11, "bold")
         ).pack(side="left")
-        self._mkbtn(head, "关闭", on_close, font_size=9).pack(
+        self._mkbtn(head, "关闭", on_close, font_size=9, in_header=True).pack(
             side="right", padx=(6, 14), pady=8
         )
         btn_export = self._mkbtn(head, "导出", None, primary=True, font_size=9)
         btn_export.pack(side="right", pady=8)
-        tk.Frame(win, bg=HEADER_LINE, height=1).pack(fill="x")
+        hfade = tk.Canvas(win, height=28, bg=HEADER_L, bd=0, highlightthickness=0)
+        hfade.pack(fill="x")
+        self._vfade(hfade, HEADER_L, BG, wave=True)
         win.after(150, lambda: self._titlebar(win))
 
         body = tk.Frame(win, bg=BG)
@@ -2414,14 +2813,16 @@ class App:
         win.resizable(False, False)
         self._apply_icon(win)
 
-        # 设置窗口顶栏：与主窗口同款浅天蓝 + 金色竖条
+        # 设置窗口顶栏：与主窗口同款珍珠雾蓝 + 香槟金竖条，下方柔化过渡
         shead = tk.Frame(win, bg=HEADER_L, height=44)
         shead.pack(fill="x")
         shead.pack_propagate(False)
-        sbar = tk.Frame(shead, bg=GOLD, width=3, height=14)
+        sbar = tk.Frame(shead, bg=GOLD_STAR, width=3, height=14)
         sbar.pack(side="left", padx=(16, 8))
-        tk.Label(shead, text="设置", fg=FG, bg=HEADER_L, font=(FONT, 11, "bold")).pack(side="left")
-        tk.Frame(win, bg=HEADER_LINE, height=1).pack(fill="x")
+        tk.Label(shead, text="设置", fg=HEADER_FG, bg=HEADER_L, font=(FONT, 11, "bold")).pack(side="left")
+        sfade = tk.Canvas(win, height=28, bg=HEADER_L, bd=0, highlightthickness=0)
+        sfade.pack(fill="x")
+        self._vfade(sfade, HEADER_L, BG, wave=True)
         win.after(150, lambda: self._titlebar(win))
 
         def field(label, value, show=None):
@@ -2598,8 +2999,55 @@ class App:
             win.destroy()
             self.status.config(text="设置已保存 · 选词试试")
 
-    # ------------------------------------------------------------ 退出
-    def on_close(self) -> None:
+    # ------------------------------------------------------------ 托盘 / 退出
+    def hide_to_tray(self) -> None:
+        """点右上角关闭：隐藏到系统托盘，只有托盘菜单的「退出」才真正结束程序。"""
+        try:
+            self.cfg["window_pos"] = [self.root.winfo_x(), self.root.winfo_y()]
+            save_config(self.cfg)
+        except Exception:
+            pass
+        if not self._ensure_tray():
+            self.quit_app()
+            return
+        try:
+            if self.listening:
+                self.toggle_listen()
+            self.status.config(text="已隐藏到托盘 · 点托盘图标恢复")
+            self.root.withdraw()
+        except Exception:
+            log("隐藏到托盘失败\n" + traceback.format_exc())
+            self.quit_app()
+
+    def _ensure_tray(self) -> bool:
+        """首次隐藏时创建托盘图标；创建失败返回 False。"""
+        if self.tray is not None:
+            return True
+        if TrayIcon is None:
+            log("系统托盘模块不可用")
+            return False
+        try:
+            self.tray = TrayIcon(
+                icon_path=str(resource_path("app.ico")),
+                tip="划词问答",
+                on_show=lambda: self.msg_q.put(("tray", 0, "show")),
+                on_quit=lambda: self.msg_q.put(("tray", 0, "quit")),
+                log=log,
+            )
+            self.tray.start()
+            return True
+        except Exception:
+            self.tray = None
+            log("系统托盘初始化失败\n" + traceback.format_exc())
+            return False
+
+    def quit_app(self) -> None:
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
         try:
             self.cfg["window_pos"] = [self.root.winfo_x(), self.root.winfo_y()]
             save_config(self.cfg)

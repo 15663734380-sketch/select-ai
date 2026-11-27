@@ -2,7 +2,7 @@
 ; 安装到用户目录，无需管理员权限；桌面快捷方式可选。
 
 #define AppName "划词问答"
-#define AppVersion "1.0.5"
+#define AppVersion "1.0.6"
 #define AppExe "划词问答.exe"
 
 [Setup]
