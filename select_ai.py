@@ -170,6 +170,32 @@ def save_config(cfg: dict) -> None:
         log("保存配置失败\n" + traceback.format_exc())
 
 
+# 常见 OpenAI 兼容服务商：选择后自动填入接口地址与默认模型
+PROVIDERS = {
+    "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-flash"),
+    "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+    "智谱 GLM": ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    "月之暗面 Kimi": ("https://api.moonshot.cn/v1", "moonshot-v1-8k"),
+    "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
+}
+
+
+def provider_of(base_url: str) -> str:
+    """按接口地址识别服务商；匹配不到时返回「自定义」。"""
+    base = str(base_url or "")
+    hosts = {
+        "api.deepseek.com": "DeepSeek",
+        "dashscope.aliyuncs.com": "通义千问",
+        "open.bigmodel.cn": "智谱 GLM",
+        "api.moonshot.cn": "月之暗面 Kimi",
+        "api.openai.com": "OpenAI",
+    }
+    for host, name in hosts.items():
+        if host in base:
+            return name
+    return "自定义"
+
+
 def enable_dpi_awareness() -> None:
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -2286,7 +2312,11 @@ class App:
             return
 
         base = (cfg.get("base_url") or "").strip().rstrip("/")
-        url = base + "/chat/completions"
+        if not base:
+            self.msg_q.put(("error", gen, "还没有配置接口地址。\n点右上角「设置」，选择服务商或手动填写 OpenAI 兼容接口地址。"))
+            return
+        # 允许直接粘贴完整接口地址，也允许只填到 /v1
+        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
         limit = int(cfg.get("max_chars") or 2000)
         cut = text if len(text) <= limit else text[:limit] + "…"
         # 联网搜索：仅 DeepSeek 官方接口支持 deepseek_web_search 服务端工具
@@ -2365,24 +2395,60 @@ class App:
                     )
                     return
                 r.encoding = "utf-8"
-                for raw in r.iter_lines(decode_unicode=True):
-                    if self.gen != gen:
-                        return
-                    if not raw or not raw.startswith("data:"):
-                        continue
-                    data = raw[5:].strip()
-                    if data == "[DONE]":
-                        break
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" not in ctype:
+                    # 兼容不支持流式的服务商：按普通 JSON 响应解析
                     try:
-                        obj = json.loads(data)
-                        delta = obj["choices"][0].get("delta") or {}
-                        piece = delta.get("content") or ""
+                        obj = r.json()
+                        msg = (obj.get("choices") or [{}])[0].get("message") or {}
+                        piece = msg.get("content") or ""
+                        if isinstance(piece, list):
+                            piece = "".join(
+                                p.get("text", "") for p in piece if isinstance(p, dict)
+                            )
                     except Exception:
-                        continue
-                    if piece:
-                        buf.append(piece)
-                        self.msg_q.put(("delta", gen, piece))
+                        piece = ""
+                    if not piece:
+                        self.msg_q.put(("error", gen, "接口返回了无法识别的响应格式。"))
+                        return
+                    buf.append(piece)
+                    self.msg_q.put(("delta", gen, piece))
+                else:
+                    for raw in r.iter_lines(decode_unicode=True):
+                        if self.gen != gen:
+                            return
+                        if not raw or not raw.startswith("data:"):
+                            continue
+                        data = raw[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data)
+                        except Exception:
+                            continue
+                        if isinstance(obj, dict) and obj.get("error"):
+                            err = obj["error"]
+                            msg = err.get("message") if isinstance(err, dict) else err
+                            self.msg_q.put(("error", gen, f"接口返回错误：{msg}"))
+                            return
+                        try:
+                            delta = obj["choices"][0].get("delta") or {}
+                            piece = delta.get("content") or ""
+                        except Exception:
+                            continue
+                        if isinstance(piece, list):
+                            piece = "".join(
+                                p.get("text", "") for p in piece if isinstance(p, dict)
+                            )
+                        if piece:
+                            buf.append(piece)
+                            self.msg_q.put(("delta", gen, piece))
             if self.gen != gen:
+                return
+            if not buf:
+                self.msg_q.put(
+                    ("error", gen, "接口没有返回内容，请检查模型名与接口地址是否匹配。")
+                )
                 return
             cost = time.time() - started
             self.msg_q.put(("done", gen, "".join(buf)))
@@ -2846,9 +2912,33 @@ class App:
             e.insert(0, value or "")
             return e
 
+        tk.Label(win, text="服务商（选择后自动填入地址与模型）", fg=SUB, bg=BG, font=(FONT, 9)).pack(
+            anchor="w", padx=16, pady=(10, 2)
+        )
+        v_prov = tk.StringVar(value=provider_of(self.cfg.get("base_url", "")))
+        combo_prov = ttk.Combobox(
+            win,
+            textvariable=v_prov,
+            values=list(PROVIDERS) + ["自定义"],
+            state="readonly",
+            font=(FONT, 9),
+        )
+        combo_prov.pack(anchor="w", padx=16)
+
         e_url = field("接口地址（OpenAI 兼容，通常以 /v1 结尾）", self.cfg.get("base_url", ""))
         e_model = field("模型名", self.cfg.get("model", ""))
         e_key = field("API Key", self.cfg.get("api_key", ""), show="•")
+
+        def on_provider(*_):
+            name = v_prov.get()
+            if name in PROVIDERS:
+                base, model = PROVIDERS[name]
+                e_url.delete(0, "end")
+                e_url.insert(0, base)
+                e_model.delete(0, "end")
+                e_model.insert(0, model)
+
+        combo_prov.bind("<<ComboboxSelected>>", on_provider)
 
         tk.Label(win, text="提示词（决定回答风格）", fg=SUB, bg=BG, font=(FONT, 9)).pack(
             anchor="w", padx=16, pady=(10, 2)
@@ -2856,6 +2946,7 @@ class App:
         t_prompt = tk.Text(
             win,
             height=5,
+            width=1,  # 宽度交给窗口自适应，避免把设置窗口撑得过宽
             bg=CARD,
             fg=FG,
             insertbackground=FG,
@@ -2949,10 +3040,8 @@ class App:
         ).pack(anchor="w", padx=14, pady=(6, 0))
 
         tip = (
-            "常用地址：\n"
-            "DeepSeek  https://api.deepseek.com/v1  模型 deepseek-flash（V4.1）或 deepseek-v4-pro\n"
-            "通义千问  https://dashscope.aliyuncs.com/compatible-mode/v1  模型 qwen-plus\n"
-            "智谱      https://open.bigmodel.cn/api/paas/v4  模型 glm-4-flash"
+            "选择上方服务商会自动填入接口地址与默认模型，也可以手动填写任意 OpenAI 兼容地址。\n"
+            "联网搜索仅 DeepSeek 官方接口支持，其他服务商会自动忽略。"
         )
         tk.Label(
             win, text=tip, fg=SUB, bg=BG, font=(FONT, 8), justify="left", wraplength=440
@@ -3011,7 +3100,11 @@ class App:
         except Exception:
             pass
         if not self._ensure_tray():
-            self.quit_app()
+            # 托盘不可用时退回最小化，避免点关闭直接把程序结束
+            try:
+                self.root.iconify()
+            except Exception:
+                self.quit_app()
             return
         try:
             if self.listening:

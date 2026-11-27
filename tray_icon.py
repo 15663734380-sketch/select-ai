@@ -7,6 +7,7 @@
 """
 import ctypes
 import threading
+import time
 from ctypes import wintypes
 
 # 使用独立 WinDLL 实例，避免 .argtypes 覆盖全局 windll.user32 影响 pynput 等模块的 GetMessageW
@@ -214,7 +215,14 @@ class TrayIcon:
             nid.uCallbackMessage = WM_TRAY
             nid.hIcon = hicon
             nid.szTip = self.tip
-            if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+            # Explorer 刚启动/重启时注册可能短暂失败，重试几次
+            added = False
+            for _ in range(5):
+                if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+                    added = True
+                    break
+                time.sleep(0.2)
+            if not added:
                 raise OSError("注册托盘图标失败")
             self._nid = nid
             self._ready.set()
