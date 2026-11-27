@@ -20,6 +20,6 @@
 安装依赖后执行 `pythonw select_ai.py`，首次使用在「设置」里填写 API Key。
 
 ## 其他
-https://platform.deepseek.com/usage；  在这个平台上买API key然后用Flash模型便宜还好用，推荐一下（目前也仅支持DeepSeek平台的API key）
+https://platform.deepseek.com/usage；  在这个平台上买API key然后用Flash模型便宜还好用，推荐一下（目前也仅支持DeepSeek平台的API key，理论上支持其他平台的API key，但是没尝试过）。
 
 为了防止内存不断叠加增大所做的轻量化处理，历史问答仅保留近 100 轮对话，当有超过 100 轮的新一轮问答时，最早的一轮问答会被删除掉
