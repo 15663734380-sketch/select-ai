@@ -109,7 +109,7 @@ MONO = "Consolas"
 
 DOC_CHUNK = 700      # 文档分块大小（字符）
 DOC_TOP_K = 4        # 每次最多引用的片段数
-DOC_BUDGET = 100000    # 每次随问题附带的文档片段总字数上限
+DOC_BUDGET = 30000     # 每次随问题附带的文档片段总字数（新用户默认值，可在设置中调高）
 
 HEADING_RE = re.compile(
     r"^(#{1,6}\s|第[一二三四五六七八九十百零两\d]+[章节篇部]|chapter\s+\d)",
@@ -121,9 +121,12 @@ DEFAULT_CONFIG = {
     "model": "deepseek-flash",
     "api_key": "",
     "system_prompt": (
-        "你是精炼的学习助手。用户会发来阅读时选中的一段文字，请立刻用中文解释："
+        "你是精炼的学习助手。用户会发来阅读时选中的一段文字，请用中文解释："
         "它在讲什么、关键概念是什么、为什么重要；若是代码或公式，说明作用与原理。"
-        "默认控制在 150 字以内，必要时用短分点，不要复述原文。"
+        "默认控制在 200 字以内，必要时用短分点，不要复述原文。"
+        "未加载参考文档时直接快速作答；加载了参考文档时，请先深入分析文档片段与问题的关联、"
+        "梳理相关证据后再作答，回答可适当展开到 400 字左右，不要急于下结论；"
+        "若文档片段没有覆盖提问内容，请使用联网搜索查找相关资料后作答。"
     ),
     "max_chars": 2000,
     "doc_context_chars": DOC_BUDGET,
@@ -159,6 +162,28 @@ def load_config() -> dict:
     if "deepseek.com" in str(cfg.get("base_url") or ""):
         if cfg.get("model") in ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"):
             cfg["model"] = "deepseek-flash"
+    # 旧版内置提示词自动升级到整合后的新默认值；用户自定义过的提示词保持不变
+    base_200 = (
+        "你是精炼的学习助手。用户会发来阅读时选中的一段文字，请用中文解释："
+        "它在讲什么、关键概念是什么、为什么重要；若是代码或公式，说明作用与原理。"
+        "默认控制在 200 字以内，必要时用短分点，不要复述原文。"
+    )
+    legacy_prompts = {
+        (
+            "你是精炼的学习助手。用户会发来阅读时选中的一段文字，请立刻用中文解释："
+            "它在讲什么、关键概念是什么、为什么重要；若是代码或公式，说明作用与原理。"
+            "默认控制在 150 字以内，必要时用短分点，不要复述原文。"
+        ),
+        base_200,
+        base_200
+        + "\n加载文档的情况下，若提问词在文档中找不到相关的，就自己去联网搜索找到相关的",
+        base_200
+        + "未加载参考文档时直接快速作答；加载了参考文档时，请先深入分析文档片段与问题的关联、"
+        "充分思考后再给出简洁答案，不要急于下结论；若文档片段没有覆盖提问内容，"
+        "请使用联网搜索查找相关资料后作答。",
+    }
+    if (cfg.get("system_prompt") or "").strip() in legacy_prompts:
+        cfg["system_prompt"] = DEFAULT_CONFIG["system_prompt"]
     return cfg
 
 
@@ -376,6 +401,56 @@ def retrieve_chunk_indices(query: str, chunks, grams, top_k: int = DOC_TOP_K, bu
 def retrieve_chunks(query: str, chunks, grams, top_k: int = DOC_TOP_K, budget: int = DOC_BUDGET) -> list:
     """挑出与选中文字最相关的片段，按原文顺序返回。"""
     return [chunks[i] for i in retrieve_chunk_indices(query, chunks, grams, top_k, budget)]
+
+
+def doc_query_relevant(query: str, chunks, grams) -> bool:
+    """判断提问词是否能在文档中找到相关内容（阈值与检索一致）。"""
+    if not chunks:
+        return False
+    q = _bigrams(query)
+    if len(q) >= 4 and grams and len(grams) == len(chunks):
+        best = max((len(q & g) / len(q) for g in grams), default=0.0)
+        return best >= 0.08
+    # 短查询无法用二元组打分时，直接看原文是否包含
+    text = re.sub(r"\s+", "", query or "")
+    if len(text) >= 2:
+        return any(text in re.sub(r"\s+", "", c) for c in chunks)
+    # 查询过短，无法判断，按“有相关”处理，避免误触发联网搜索
+    return True
+
+
+def context_too_long(detail: str) -> bool:
+    """识别接口返回的上下文超限错误。"""
+    low = (detail or "").lower()
+    return (
+        "too long" in low
+        or "exceeds max" in low
+        or "maximum context" in low
+        or ("context" in low and "exceed" in low)
+        or "上下文过长" in low
+        or "超出" in low
+    )
+
+
+def shrink_doc_chunks(chunks):
+    """上下文超限时把文档片段总量减半，保证总量确实下降。"""
+    total = sum(len(c) for c in chunks)
+    if total <= 0:
+        return chunks
+    target = max(1000, total // 2)
+    out, used = [], 0
+    for c in chunks:
+        remain = target - used
+        if remain <= 0:
+            break
+        if len(c) <= remain:
+            out.append(c)
+            used += len(c)
+        else:
+            out.append(c[:remain])
+            used = target
+            break
+    return out
 
 
 class App:
@@ -1641,7 +1716,7 @@ class App:
         except Exception:
             budget = DOC_BUDGET
         if budget <= 0:
-            return [], ()
+            return [], (), False
         # 引用片段数随预算放大，避免调大字数后仍只取 4 段
         top_k = max(DOC_TOP_K, budget // DOC_CHUNK + 2)
         with self.doc_lock:
@@ -1649,12 +1724,13 @@ class App:
             sources = self.doc_sources
             grams = self.doc_grams
             doc_names = tuple(d["name"] for d in self.docs)
+        relevant = doc_query_relevant(query, chunks, grams)
         indices = retrieve_chunk_indices(query, chunks, grams, top_k, budget)
         if len(doc_names) > 1:
             picked = [f"【{sources[i]}】\n{chunks[i]}" for i in indices]
         else:
             picked = [chunks[i] for i in indices]
-        return picked, doc_names
+        return picked, doc_names, relevant
 
     # ------------------------------------------------------------ 监听状态
     def toggle_listen(self) -> None:
@@ -2794,150 +2870,201 @@ class App:
         url = base if base.endswith("/chat/completions") else base + "/chat/completions"
         limit = int(cfg.get("max_chars") or 2000)
         cut = text if len(text) <= limit else text[:limit] + "…"
-        # 联网搜索：仅 DeepSeek 官方接口支持 deepseek_web_search 服务端工具
-        web = bool(cfg.get("web_search")) and "api.deepseek.com" in base
-
         # 检索文档中最相关的片段，让回答优先依据文档内容
         self._refresh_doc_if_needed()
-        doc_chunks, doc_names = self._pick_doc_chunks(text)
-        user_content = ("用户的问题或选中的文字：\n" if web else "选中文本：\n") + cut + "\n\n"
-        if doc_chunks:
-            if len(doc_names) <= 1:
-                doc_desc = f"参考文档《{doc_names[0] if doc_names else '参考文档'}》"
-            else:
-                listed = "、".join(f"《{n}》" for n in doc_names[:6])
-                if len(doc_names) > 6:
-                    listed += f" 等 {len(doc_names)} 份文档"
-                doc_desc = f"参考文档（{listed}）"
+        doc_chunks, doc_names, doc_relevant = self._pick_doc_chunks(text)
+        with self.doc_lock:
+            docs_loaded = bool(self.docs)
+
+        # 联网搜索：仅 DeepSeek 官方接口支持 deepseek_web_search 服务端工具
+        web = bool(cfg.get("web_search")) and "api.deepseek.com" in base
+        # 已加载文档但检索不到相关内容时，自动联网搜索兜底
+        auto_web = docs_loaded and not doc_relevant and "api.deepseek.com" in base
+        if auto_web:
+            web = True
+            doc_chunks = []  # 文档未命中时不附送无关片段，直接按问题联网搜索
+
+        now = datetime.now()
+        week = "星期" + "一二三四五六日"[now.weekday()]
+
+        def build_payload(chunks):
+            user_content = (
+                "用户的问题或选中的文字：\n" if web else "选中文本：\n"
+            ) + cut + "\n\n"
+            if chunks:
+                if len(doc_names) <= 1:
+                    doc_desc = f"参考文档《{doc_names[0] if doc_names else '参考文档'}》"
+                else:
+                    listed = "、".join(f"《{n}》" for n in doc_names[:6])
+                    if len(doc_names) > 6:
+                        listed += f" 等 {len(doc_names)} 份文档"
+                    doc_desc = f"参考文档（{listed}）"
+                user_content += (
+                    f"{doc_desc}中的相关片段（按原文顺序）：\n<<<\n"
+                    + "\n\n……\n\n".join(chunks)
+                    + "\n>>>\n\n"
+                    "请优先依据上面的文档片段解释选中文本；"
+                    + (
+                        "如果文档片段没有覆盖相关内容，请使用联网搜索查找相关资料后再回答。\n\n"
+                        if web
+                        else "如果文档片段没有覆盖相关内容，可以用通用知识补充，但要说明“文档中未涉及”。\n\n"
+                    )
+                )
             user_content += (
-                f"{doc_desc}中的相关片段（按原文顺序）：\n<<<\n"
-                + "\n\n……\n\n".join(doc_chunks)
-                + "\n>>>\n\n"
-                "请优先依据上面的文档片段解释选中文本；如果文档片段没有覆盖相关内容，"
-                "可以用通用知识补充，但要说明“文档中未涉及”。\n\n"
-            )
-        user_content += (
-            "请直接回答；若这段文字本身需要解释，就解释它。"
-            if web
-            else "请解释这段内容。"
-        )
-
-        system_prompt = cfg.get("system_prompt") or DEFAULT_CONFIG["system_prompt"]
-        if web:
-            now = datetime.now()
-            week = "星期" + "一二三四五六日"[now.weekday()]
-            system_prompt += (
-                f"\n\n已开启联网搜索。当前本机时间：{now:%Y-%m-%d %H:%M:%S}（{week}，北京时间）。"
-                "涉及时间或实时信息时，以此时间为准，搜索结果的发布时间只用于判断信息新旧；"
-                "如果用户是在提问，请直接回答，不要只解释问题本身。"
+                "请直接回答；若这段文字本身需要解释，就解释它。"
+                if web
+                else "请解释这段内容。"
             )
 
-        messages = [{"role": "system", "content": system_prompt}]
-        if web:
-            # DeepSeek 用户元信息标记：让模型知道今天的日期与所在地
-            messages.append(
-                {
-                    "role": "latest_reminder",
-                    "content": f"{now:%Y-%m-%d},{week},中国,Web,中文",
+            system_prompt = cfg.get("system_prompt") or DEFAULT_CONFIG["system_prompt"]
+            if web:
+                system_prompt += (
+                    f"\n\n已开启联网搜索。当前本机时间：{now:%Y-%m-%d %H:%M:%S}（{week}，北京时间）。"
+                    "涉及时间或实时信息时，以此时间为准，搜索结果的发布时间只用于判断信息新旧；"
+                    "如果用户是在提问，请直接回答，不要只解释问题本身。"
+                )
+            messages = [{"role": "system", "content": system_prompt}]
+            if web:
+                # DeepSeek 用户元信息标记：让模型知道今天的日期与所在地
+                messages.append(
+                    {
+                        "role": "latest_reminder",
+                        "content": f"{now:%Y-%m-%d},{week},中国,Web,中文",
+                    }
+                )
+            messages.append({"role": "user", "content": user_content})
+            payload = {
+                "model": cfg.get("model") or "deepseek-flash",
+                "messages": messages,
+                "stream": True,
+                "temperature": 0.3,
+            }
+            # DeepSeek 新模型默认开启思考模式；未加载文档时划词解释求快，显式关闭；
+            # 加载文档后开启深度思考，让回答更充分（耗时与 token 消耗会相应增加）
+            if "api.deepseek.com" in base:
+                payload["thinking"] = {
+                    "type": "enabled" if docs_loaded else "disabled"
                 }
-            )
-        messages.append({"role": "user", "content": user_content})
+            if web:
+                payload["tools"] = [{"type": "deepseek_web_search"}]
+            return payload
 
-        payload = {
-            "model": cfg.get("model") or "deepseek-flash",
-            "messages": messages,
-            "stream": True,
-            "temperature": 0.3,
-        }
-        # DeepSeek 新模型默认开启思考模式；划词解释求快，这里显式关闭
-        if "api.deepseek.com" in base:
-            payload["thinking"] = {"type": "disabled"}
-        if web:
-            payload["tools"] = [{"type": "deepseek_web_search"}]
-        if doc_chunks:
-            self.msg_q.put(
-                ("status", gen, f"识别 {len(text)} 字 · 引用文档 {len(doc_chunks)} 段")
-            )
         headers = {
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
         started = time.time()
-        buf = []
-        try:
-            with requests.post(
-                url, headers=headers, json=payload, stream=True, timeout=(10, 120)
-            ) as r:
-                if r.status_code != 200:
-                    detail = r.text[:300].replace("\n", " ")
+        attempts = 0
+        chunks = doc_chunks
+        while True:
+            payload = build_payload(chunks)
+            if chunks:
+                suffix = " · 深度思考中" if docs_loaded and "api.deepseek.com" in base else ""
+                self.msg_q.put(
+                    ("status", gen, f"识别 {len(text)} 字 · 引用文档 {len(chunks)} 段{suffix}")
+                )
+            elif auto_web:
+                self.msg_q.put(
+                    ("status", gen, f"识别 {len(text)} 字 · 文档未命中，联网搜索中")
+                )
+            buf = []
+            try:
+                with requests.post(
+                    url, headers=headers, json=payload, stream=True, timeout=(10, 120)
+                ) as r:
+                    if r.status_code != 200:
+                        detail = r.text[:300].replace("\n", " ")
+                        if (
+                            r.status_code == 400
+                            and chunks
+                            and attempts < 2
+                            and context_too_long(r.text)
+                        ):
+                            chunks = shrink_doc_chunks(chunks)
+                            attempts += 1
+                            reduced = sum(len(c) for c in chunks)
+                            self.msg_q.put(
+                                ("status", gen, f"上下文过长，文档已缩减至 {reduced} 字后重试…")
+                            )
+                            continue
+                        self.msg_q.put(
+                            ("error", gen, f"请求失败 HTTP {r.status_code}\n{detail}")
+                        )
+                        return
+                    r.encoding = "utf-8"
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    if "text/event-stream" not in ctype:
+                        # 兼容不支持流式的服务商：按普通 JSON 响应解析
+                        try:
+                            obj = r.json()
+                            msg = (obj.get("choices") or [{}])[0].get("message") or {}
+                            piece = msg.get("content") or ""
+                            if isinstance(piece, list):
+                                piece = "".join(
+                                    p.get("text", "") for p in piece if isinstance(p, dict)
+                                )
+                        except Exception:
+                            piece = ""
+                        if not piece:
+                            self.msg_q.put(("error", gen, "接口返回了无法识别的响应格式。"))
+                            return
+                        buf.append(piece)
+                        self.msg_q.put(("delta", gen, piece))
+                    else:
+                        for raw in r.iter_lines(decode_unicode=True):
+                            if self.gen != gen:
+                                return
+                            if not raw or not raw.startswith("data:"):
+                                continue
+                            data = raw[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(data)
+                            except Exception:
+                                continue
+                            if isinstance(obj, dict) and obj.get("error"):
+                                err = obj["error"]
+                                msg = err.get("message") if isinstance(err, dict) else err
+                                self.msg_q.put(("error", gen, f"接口返回错误：{msg}"))
+                                return
+                            try:
+                                delta = obj["choices"][0].get("delta") or {}
+                                piece = delta.get("content") or ""
+                            except Exception:
+                                continue
+                            if isinstance(piece, list):
+                                piece = "".join(
+                                    p.get("text", "") for p in piece if isinstance(p, dict)
+                                )
+                            if piece:
+                                buf.append(piece)
+                                self.msg_q.put(("delta", gen, piece))
+                if self.gen != gen:
+                    return
+                if not buf:
                     self.msg_q.put(
-                        ("error", gen, f"请求失败 HTTP {r.status_code}\n{detail}")
+                        ("error", gen, "接口没有返回内容，请检查模型名与接口地址是否匹配。")
                     )
                     return
-                r.encoding = "utf-8"
-                ctype = (r.headers.get("Content-Type") or "").lower()
-                if "text/event-stream" not in ctype:
-                    # 兼容不支持流式的服务商：按普通 JSON 响应解析
-                    try:
-                        obj = r.json()
-                        msg = (obj.get("choices") or [{}])[0].get("message") or {}
-                        piece = msg.get("content") or ""
-                        if isinstance(piece, list):
-                            piece = "".join(
-                                p.get("text", "") for p in piece if isinstance(p, dict)
-                            )
-                    except Exception:
-                        piece = ""
-                    if not piece:
-                        self.msg_q.put(("error", gen, "接口返回了无法识别的响应格式。"))
-                        return
-                    buf.append(piece)
-                    self.msg_q.put(("delta", gen, piece))
-                else:
-                    for raw in r.iter_lines(decode_unicode=True):
-                        if self.gen != gen:
-                            return
-                        if not raw or not raw.startswith("data:"):
-                            continue
-                        data = raw[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            continue
-                        if isinstance(obj, dict) and obj.get("error"):
-                            err = obj["error"]
-                            msg = err.get("message") if isinstance(err, dict) else err
-                            self.msg_q.put(("error", gen, f"接口返回错误：{msg}"))
-                            return
-                        try:
-                            delta = obj["choices"][0].get("delta") or {}
-                            piece = delta.get("content") or ""
-                        except Exception:
-                            continue
-                        if isinstance(piece, list):
-                            piece = "".join(
-                                p.get("text", "") for p in piece if isinstance(p, dict)
-                            )
-                        if piece:
-                            buf.append(piece)
-                            self.msg_q.put(("delta", gen, piece))
-            if self.gen != gen:
-                return
-            if not buf:
+                cost = time.time() - started
+                self.msg_q.put(("done", gen, "".join(buf)))
+                retry_note = (
+                    f" · 文档已自动缩减至 {sum(len(c) for c in chunks)} 字"
+                    if attempts
+                    else ""
+                )
                 self.msg_q.put(
-                    ("error", gen, "接口没有返回内容，请检查模型名与接口地址是否匹配。")
+                    ("status", gen, f"完成 · {cost:.1f}s{retry_note}")
                 )
                 return
-            cost = time.time() - started
-            self.msg_q.put(("done", gen, "".join(buf)))
-            self.msg_q.put(("status", gen, f"完成 · {cost:.1f}s"))
-        except requests.exceptions.Timeout:
-            self.msg_q.put(("error", gen, "请求超时，请检查网络或接口地址。"))
-        except Exception as e:
-            self.msg_q.put(("error", gen, f"网络错误：{e}"))
+            except requests.exceptions.Timeout:
+                self.msg_q.put(("error", gen, "请求超时，请检查网络或接口地址。"))
+                return
+            except Exception as e:
+                self.msg_q.put(("error", gen, f"网络错误：{e}"))
+                return
 
     # ------------------------------------------------------------ UI 更新
     def _pump(self) -> None:
